@@ -1,0 +1,10 @@
+.price_cache/
+.price_cache_parallel_test/
+.price_cache_test/
+__pycache__/
+.streamlit/cache/
+*.pyc
+*.pyo
+*.log
+.DS_Store
+Thumbs.db
