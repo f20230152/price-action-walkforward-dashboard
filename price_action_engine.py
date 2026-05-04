@@ -14,7 +14,7 @@ import pandas as pd
 
 DATE_FILE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.csv$")
 EPS = 1e-12
-CACHE_VERSION = "v2"
+CACHE_VERSION = "v3"
 
 
 @dataclass(frozen=True)
@@ -30,6 +30,25 @@ class StrategyParams:
         return (
             f"a={self.delay_s}s | b={self.threshold_cents:g}c | "
             f"c={self.lookback_s}s | d={self.hold_s}s | {self.direction}"
+        )
+
+
+@dataclass(frozen=True)
+class SpikeParams:
+    delay_s: int
+    threshold_cents: float
+    lookback_s: int
+    hold_s: int
+    volume_window_s: int = 300
+    volume_multiple: float = 0.0
+    direction: str = "momentum"
+
+    @property
+    def label(self) -> str:
+        vol = "vol off" if self.volume_multiple <= 0 else f"vol>{self.volume_multiple:g}x/{self.volume_window_s}s"
+        return (
+            f"a={self.delay_s}s | move={self.threshold_cents:g}c/{self.lookback_s}s | "
+            f"hold={self.hold_s}s | {vol} | {self.direction}"
         )
 
 
@@ -60,7 +79,7 @@ def discover_csv_files(data_dir: str | Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _pick_columns(columns: Iterable[str]) -> tuple[str, str]:
+def _pick_columns(columns: Iterable[str]) -> tuple[str, str, str | None]:
     cols = list(columns)
     price_cols = [c for c in cols if "price" in c.lower()]
     if not price_cols:
@@ -72,7 +91,9 @@ def _pick_columns(columns: Iterable[str]) -> tuple[str, str]:
 
     # Older files contain Time plus Time.1; Time.1 is ISO-like and less ambiguous.
     time_col = "Time.1" if "Time.1" in time_cols else time_cols[0]
-    return time_col, price_cols[0]
+    size_cols = [c for c in cols if "size" in c.lower() or "volume" in c.lower()]
+    size_col = size_cols[0] if size_cols else None
+    return time_col, price_cols[0], size_col
 
 
 def _cache_file_for(file: Path, cache_dir: Path | None) -> Path | None:
@@ -110,10 +131,18 @@ def load_file_to_seconds(file: str | Path, cache_dir: str | Path | None = None) 
         return cached
 
     header = pd.read_csv(file, nrows=0)
-    time_col, price_col = _pick_columns(header.columns)
-    raw = pd.read_csv(file, usecols=[time_col, price_col], dtype={time_col: str})
-    raw = raw.rename(columns={time_col: "time", price_col: "price"})
+    time_col, price_col, size_col = _pick_columns(header.columns)
+    usecols = [time_col, price_col] + ([size_col] if size_col else [])
+    raw = pd.read_csv(file, usecols=usecols, dtype={time_col: str})
+    rename_cols = {time_col: "time", price_col: "price"}
+    if size_col:
+        rename_cols[size_col] = "volume"
+    raw = raw.rename(columns=rename_cols)
     raw["price"] = pd.to_numeric(raw["price"], errors="coerce")
+    if "volume" in raw.columns:
+        raw["volume"] = pd.to_numeric(raw["volume"], errors="coerce").fillna(0.0)
+    else:
+        raw["volume"] = 0.0
     raw = raw.dropna(subset=["time", "price"])
 
     stats = {
@@ -127,35 +156,39 @@ def load_file_to_seconds(file: str | Path, cache_dir: str | Path | None = None) 
         "last_price": np.nan,
     }
     if raw.empty:
-        _write_cached_day(cache_file, pd.Series(dtype=float, name="price"), stats)
-        return pd.Series(dtype=float, name="price"), stats
+        empty = pd.DataFrame(columns=["price", "volume"])
+        _write_cached_day(cache_file, empty, stats)
+        return empty, stats
 
     # Timestamp strings are second-granular in these files and heavily duplicated.
     # Grouping before datetime parsing avoids parsing millions of duplicate strings.
     time_key = raw["time"].str.slice(0, 19).str.replace("T", " ", regex=False)
-    by_second = raw.groupby(time_key, sort=True)["price"].last().astype(float)
+    by_second = raw.groupby(time_key, sort=True).agg(price=("price", "last"), volume=("volume", "sum")).astype(float)
     parsed_index = pd.to_datetime(by_second.index, format="%Y-%m-%d %H:%M:%S", errors="coerce")
     by_second.index = parsed_index
     by_second = by_second[by_second.index.notna()].sort_index()
     if by_second.empty:
-        _write_cached_day(cache_file, pd.Series(dtype=float, name="price"), stats)
-        return pd.Series(dtype=float, name="price"), stats
+        empty = pd.DataFrame(columns=["price", "volume"])
+        _write_cached_day(cache_file, empty, stats)
+        return empty, stats
 
     idx = pd.date_range(by_second.index.min(), by_second.index.max(), freq="1s")
-    second_price = by_second.reindex(idx).ffill()
-    second_price.name = "price"
+    second_bars = by_second.reindex(idx)
+    second_bars["price"] = second_bars["price"].ffill()
+    second_bars["volume"] = second_bars["volume"].fillna(0.0)
 
     stats.update(
         {
-            "seconds": int(second_price.shape[0]),
-            "first_time": second_price.index.min(),
-            "last_time": second_price.index.max(),
-            "first_price": float(second_price.iloc[0]),
-            "last_price": float(second_price.iloc[-1]),
+            "seconds": int(second_bars.shape[0]),
+            "first_time": second_bars.index.min(),
+            "last_time": second_bars.index.max(),
+            "first_price": float(second_bars["price"].iloc[0]),
+            "last_price": float(second_bars["price"].iloc[-1]),
+            "total_volume": float(second_bars["volume"].sum()),
         }
     )
-    _write_cached_day(cache_file, second_price, stats)
-    return second_price, stats
+    _write_cached_day(cache_file, second_bars, stats)
+    return second_bars, stats
 
 
 def load_second_prices(
@@ -164,10 +197,10 @@ def load_second_prices(
     end_date: pd.Timestamp | None = None,
     cache_dir: str | Path | None = None,
     workers: int = 6,
-) -> tuple[pd.Series, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     manifest = discover_csv_files(data_dir)
     if manifest.empty:
-        return pd.Series(dtype=float, name="price"), pd.DataFrame()
+        return pd.DataFrame(columns=["price", "volume"]), pd.DataFrame()
 
     if start_date is not None:
         start_d = pd.to_datetime(start_date).date()
@@ -194,12 +227,11 @@ def load_second_prices(
             series.append(daily)
 
     if not series:
-        return pd.Series(dtype=float, name="price"), pd.DataFrame(stats_rows)
+        return pd.DataFrame(columns=["price", "volume"]), pd.DataFrame(stats_rows)
 
-    price = pd.concat(series).sort_index()
-    price = price[~price.index.duplicated(keep="last")]
-    price.name = "price"
-    return price, pd.DataFrame(stats_rows)
+    bars = pd.concat(series).sort_index()
+    bars = bars[~bars.index.duplicated(keep="last")]
+    return bars[["price", "volume"]], pd.DataFrame(stats_rows)
 
 
 def parameter_grid(
@@ -216,8 +248,32 @@ def parameter_grid(
     ]
 
 
-def prepare_day_arrays(price: pd.Series) -> list[dict]:
-    price = price.dropna().sort_index()
+def spike_parameter_grid(
+    delays: Iterable[int],
+    thresholds: Iterable[float],
+    lookbacks: Iterable[int],
+    holds: Iterable[int],
+    volume_windows: Iterable[int],
+    volume_multiples: Iterable[float],
+    direction: str = "momentum",
+) -> list[SpikeParams]:
+    return [
+        SpikeParams(int(a), float(b), int(c), int(d), int(vw), float(vm), direction)
+        for a, b, c, d, vw, vm in itertools.product(
+            delays, thresholds, lookbacks, holds, volume_windows, volume_multiples
+        )
+        if int(a) >= 0 and float(b) > 0 and int(c) > 0 and int(d) > 0 and int(vw) > 0 and float(vm) >= 0
+    ]
+
+
+def _price_series(data: pd.Series | pd.DataFrame) -> pd.Series:
+    if isinstance(data, pd.DataFrame):
+        return data["price"]
+    return data
+
+
+def prepare_day_arrays(price: pd.Series | pd.DataFrame) -> list[dict]:
+    price = _price_series(price).dropna().sort_index()
     days = []
     for date, day_price in price.groupby(price.index.normalize(), sort=True):
         days.append(
@@ -225,6 +281,24 @@ def prepare_day_arrays(price: pd.Series) -> list[dict]:
                 "date": pd.Timestamp(date),
                 "times": day_price.index.to_numpy(),
                 "prices": day_price.to_numpy(dtype=float),
+            }
+        )
+    return days
+
+
+def prepare_spike_day_arrays(bars: pd.DataFrame) -> list[dict]:
+    bars = bars.dropna(subset=["price"]).sort_index()
+    if "volume" not in bars.columns:
+        bars = bars.copy()
+        bars["volume"] = 0.0
+    days = []
+    for date, day_bars in bars.groupby(bars.index.normalize(), sort=True):
+        days.append(
+            {
+                "date": pd.Timestamp(date),
+                "times": day_bars.index.to_numpy(),
+                "prices": day_bars["price"].to_numpy(dtype=float),
+                "volume": day_bars["volume"].fillna(0.0).to_numpy(dtype=float),
             }
         )
     return days
@@ -297,6 +371,87 @@ def _scan_day(
     return trades, pnls, sides
 
 
+def _scan_spike_day(
+    day: dict,
+    params: SpikeParams,
+    cost_cents: float,
+    collect_trades: bool,
+    max_trades_per_day: int | None = 1,
+) -> tuple[list[dict], list[float], list[int]]:
+    prices = day["prices"]
+    volume = day["volume"]
+    times = day["times"]
+    n = len(prices)
+    min_required = params.lookback_s + params.delay_s + params.hold_s + 1
+    if n <= min_required:
+        return [], [], []
+
+    delta = prices[params.lookback_s :] - prices[: -params.lookback_s]
+    raw_idx = np.flatnonzero(np.abs(delta) >= params.threshold_cents / 100.0) + params.lookback_s
+    if raw_idx.size == 0:
+        return [], [], []
+
+    if params.volume_multiple > 0:
+        vol = pd.Series(volume)
+        recent_vol = vol.rolling(params.lookback_s, min_periods=1).sum().to_numpy()
+        baseline_vol = vol.rolling(params.volume_window_s, min_periods=max(1, min(params.volume_window_s, 30))).mean().to_numpy()
+        required = params.volume_multiple * baseline_vol * max(params.lookback_s, 1)
+        raw_idx = raw_idx[recent_vol[raw_idx] >= required[raw_idx]]
+        if raw_idx.size == 0:
+            return [], [], []
+    else:
+        recent_vol = pd.Series(volume).rolling(params.lookback_s, min_periods=1).sum().to_numpy()
+
+    trades = []
+    pnls = []
+    sides = []
+    last_exit = -1
+    i = 0
+    while i < raw_idx.size:
+        if max_trades_per_day is not None and len(pnls) >= max_trades_per_day:
+            break
+        event_idx = int(raw_idx[i])
+        entry_idx = event_idx + params.delay_s
+        exit_idx = entry_idx + params.hold_s
+        if exit_idx >= n:
+            break
+        if entry_idx <= last_exit:
+            i = int(np.searchsorted(raw_idx, last_exit - params.delay_s + 1, side="left"))
+            continue
+
+        move = prices[event_idx] - prices[event_idx - params.lookback_s]
+        side = 1 if move > 0 else -1
+        if params.direction == "fade":
+            side *= -1
+
+        entry_price = prices[entry_idx]
+        exit_price = prices[exit_idx]
+        gross_cents = side * (exit_price - entry_price) * 100.0
+        net_cents = gross_cents - cost_cents
+        pnls.append(float(net_cents))
+        sides.append(side)
+        if collect_trades:
+            trades.append(
+                {
+                    "signal_time": pd.Timestamp(times[event_idx]),
+                    "entry_time": pd.Timestamp(times[entry_idx]),
+                    "exit_time": pd.Timestamp(times[exit_idx]),
+                    "side": side,
+                    "move_cents": move * 100.0,
+                    "signal_volume": float(recent_vol[event_idx]),
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "gross_pnl_cents": gross_cents,
+                    "cost_cents": cost_cents,
+                    "net_pnl_cents": net_cents,
+                }
+            )
+        last_exit = exit_idx
+        i = int(np.searchsorted(raw_idx, last_exit - params.delay_s + 1, side="left"))
+
+    return trades, pnls, sides
+
+
 def _trade_summary(pnls: list[float], sides: list[int]) -> dict:
     if not pnls:
         return {
@@ -351,8 +506,81 @@ def _backtest_prepared(
     return trades_df, daily, _trade_summary(all_pnls, all_sides)
 
 
+def _backtest_spike_prepared(
+    days: list[dict],
+    params: SpikeParams,
+    cost_cents: float,
+    collect_trades: bool,
+    max_trades_per_day: int | None = 1,
+) -> tuple[pd.DataFrame, pd.Series, dict]:
+    if not days:
+        return pd.DataFrame(), pd.Series(dtype=float, name="daily_pnl_cents"), _trade_summary([], [])
+
+    all_trades: list[dict] = []
+    all_pnls: list[float] = []
+    all_sides: list[int] = []
+    daily_values = []
+    daily_index = []
+
+    for day in days:
+        trades, pnls, sides = _scan_spike_day(day, params, cost_cents, collect_trades, max_trades_per_day)
+        if collect_trades and trades:
+            all_trades.extend(trades)
+        all_pnls.extend(pnls)
+        all_sides.extend(sides)
+        daily_index.append(day["date"])
+        daily_values.append(float(np.sum(pnls)) if pnls else 0.0)
+
+    daily = pd.Series(daily_values, index=pd.Index(daily_index, name="date"), name="daily_pnl_cents")
+    trades_df = pd.DataFrame(all_trades) if collect_trades and all_trades else pd.DataFrame()
+    return trades_df, daily, _trade_summary(all_pnls, all_sides)
+
+
+def backtest_spike_strategy(
+    bars: pd.DataFrame,
+    params: SpikeParams,
+    cost_cents: float = 0.0,
+    max_trades_per_day: int | None = 1,
+) -> tuple[pd.DataFrame, pd.Series]:
+    days = prepare_spike_day_arrays(bars)
+    trades, daily, _ = _backtest_spike_prepared(days, params, cost_cents, True, max_trades_per_day)
+    return trades, daily
+
+
+def evaluate_spike_grid(
+    bars: pd.DataFrame,
+    params_list: list[SpikeParams],
+    objective: str,
+    cost_cents: float,
+    min_trades: int,
+    max_trades_per_day: int | None = 1,
+) -> pd.DataFrame:
+    rows = []
+    days = prepare_spike_day_arrays(bars)
+    for params in params_list:
+        _, daily, summary = _backtest_spike_prepared(days, params, cost_cents, False, max_trades_per_day)
+        metrics = compute_metrics(daily, trade_summary=summary)
+        score = -np.inf if metrics["trades"] < min_trades else float(metrics.get(objective, metrics["total_pnl_cents"]))
+        rows.append(
+            {
+                "params": params,
+                "label": params.label,
+                "delay_s": params.delay_s,
+                "threshold_cents": params.threshold_cents,
+                "lookback_s": params.lookback_s,
+                "hold_s": params.hold_s,
+                "volume_window_s": params.volume_window_s,
+                "volume_multiple": params.volume_multiple,
+                "direction": params.direction,
+                "score": score,
+                **metrics,
+            }
+        )
+    return pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
+
+
 def backtest_strategy(
-    price: pd.Series,
+    price: pd.Series | pd.DataFrame,
     params: StrategyParams,
     cost_cents: float = 0.0,
     max_trades_per_day: int | None = None,
@@ -416,7 +644,7 @@ def compute_metrics(daily_pnl: pd.Series, trades: pd.DataFrame | None = None, tr
 
 
 def evaluate_grid(
-    price: pd.Series,
+    price: pd.Series | pd.DataFrame,
     params_list: list[StrategyParams],
     objective: str,
     cost_cents: float,
@@ -455,7 +683,7 @@ def evaluate_grid(
 
 
 def move_frequency_grid(
-    price: pd.Series,
+    price: pd.Series | pd.DataFrame,
     lookbacks: Iterable[int],
     thresholds: Iterable[float],
 ) -> pd.DataFrame:
@@ -503,7 +731,7 @@ def move_frequency_grid(
 
 
 def run_walk_forward(
-    price: pd.Series,
+    price: pd.Series | pd.DataFrame,
     params_list: list[StrategyParams],
     train_months: int = 3,
     test_months: int = 1,
@@ -512,7 +740,7 @@ def run_walk_forward(
     min_train_trades: int = 20,
     max_trades_per_day: int | None = None,
 ) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.DataFrame]:
-    price = price.dropna().sort_index()
+    price = price.dropna(subset=["price"]).sort_index() if isinstance(price, pd.DataFrame) else price.dropna().sort_index()
     if price.empty:
         return pd.DataFrame(), pd.Series(dtype=float), pd.DataFrame(), pd.DataFrame()
 
@@ -588,7 +816,95 @@ def run_walk_forward(
     return details_df, oos_daily, trades_df, grid_df
 
 
+def run_spike_walk_forward(
+    bars: pd.DataFrame,
+    params_list: list[SpikeParams],
+    train_months: int = 3,
+    test_months: int = 1,
+    objective: str = "total_pnl_cents",
+    cost_cents: float = 0.0,
+    min_train_trades: int = 1,
+    max_trades_per_day: int | None = 1,
+) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.DataFrame]:
+    bars = bars.dropna(subset=["price"]).sort_index()
+    if bars.empty:
+        return pd.DataFrame(), pd.Series(dtype=float), pd.DataFrame(), pd.DataFrame()
+
+    month_key = bars.index.to_period("M")
+    months = pd.PeriodIndex(sorted(month_key.unique()))
+    detail_rows = []
+    all_test_daily = []
+    all_test_trades = []
+    train_grids = []
+
+    for start_i in range(train_months, len(months), test_months):
+        train_periods = months[start_i - train_months : start_i]
+        test_periods = months[start_i : start_i + test_months]
+        if len(test_periods) == 0:
+            continue
+
+        train_bars = bars[month_key.isin(train_periods)]
+        test_bars = bars[month_key.isin(test_periods)]
+        if train_bars.empty or test_bars.empty:
+            continue
+
+        grid = evaluate_spike_grid(train_bars, params_list, objective, cost_cents, min_train_trades, max_trades_per_day)
+        grid = grid.copy()
+        grid["train_start"] = str(train_periods[0])
+        grid["train_end"] = str(train_periods[-1])
+        grid["test_start"] = str(test_periods[0])
+        grid["test_end"] = str(test_periods[-1])
+        train_grids.append(grid.drop(columns=["params"]))
+
+        finite = grid[np.isfinite(grid["score"])]
+        if finite.empty:
+            continue
+
+        best_row = finite.iloc[0]
+        best_params = best_row["params"]
+        test_trades, test_daily = backtest_spike_strategy(test_bars, best_params, cost_cents, max_trades_per_day)
+        test_metrics = compute_metrics(test_daily, test_trades)
+        all_test_daily.append(test_daily)
+        if not test_trades.empty:
+            t = test_trades.copy()
+            t["params_label"] = best_params.label
+            t["test_month"] = ",".join(str(p) for p in test_periods)
+            all_test_trades.append(t)
+
+        detail_rows.append(
+            {
+                "train_start": str(train_periods[0]),
+                "train_end": str(train_periods[-1]),
+                "test_start": str(test_periods[0]),
+                "test_end": str(test_periods[-1]),
+                "selected_params": best_params.label,
+                "train_score": float(best_row["score"]),
+                "train_sharpe": float(best_row["daily_sharpe"]),
+                "train_total_pnl_cents": float(best_row["total_pnl_cents"]),
+                "train_trades": int(best_row["trades"]),
+                "test_sharpe": test_metrics["daily_sharpe"],
+                "test_total_pnl_cents": test_metrics["total_pnl_cents"],
+                "test_trades": test_metrics["trades"],
+                "test_trades_per_day": test_metrics["trades_per_day"],
+                "test_max_drawdown_cents": test_metrics["max_drawdown_cents"],
+                "test_win_rate": test_metrics["win_rate"],
+            }
+        )
+
+    if all_test_daily:
+        oos_daily = pd.concat(all_test_daily).sort_index()
+        oos_daily = oos_daily.groupby(oos_daily.index).sum()
+    else:
+        oos_daily = pd.Series(dtype=float, name="daily_pnl_cents")
+
+    trades_df = pd.concat(all_test_trades, ignore_index=True) if all_test_trades else pd.DataFrame()
+    details_df = pd.DataFrame(detail_rows)
+    grid_df = pd.concat(train_grids, ignore_index=True) if train_grids else pd.DataFrame()
+    return details_df, oos_daily, trades_df, grid_df
+
+
 def daily_close(price: pd.Series) -> pd.Series:
+    price = _price_series(price)
     if price.empty:
         return pd.Series(dtype=float, name="close")
     close = price.groupby(price.index.normalize()).last()

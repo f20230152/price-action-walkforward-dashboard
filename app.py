@@ -10,15 +10,20 @@ import streamlit as st
 
 from price_action_engine import (
     backtest_strategy,
+    backtest_spike_strategy,
     compute_metrics,
     daily_close,
     discover_csv_files,
     evaluate_grid,
+    evaluate_spike_grid,
     load_second_prices,
     move_frequency_grid,
     parameter_grid,
     parse_number_list,
+    run_spike_walk_forward,
     run_walk_forward,
+    spike_parameter_grid,
+    SpikeParams,
     StrategyParams,
 )
 
@@ -118,6 +123,37 @@ def drawdown_chart(daily: pd.Series, title: str) -> go.Figure:
     return fig
 
 
+def event_audit_chart(bars: pd.DataFrame, trade: pd.Series, minutes_before: int = 60, minutes_after: int = 240) -> go.Figure:
+    signal_time = pd.to_datetime(trade["signal_time"])
+    entry_time = pd.to_datetime(trade["entry_time"])
+    exit_time = pd.to_datetime(trade["exit_time"])
+    start = signal_time - pd.Timedelta(minutes=minutes_before)
+    end = signal_time + pd.Timedelta(minutes=minutes_after)
+    window = bars.loc[start:end].copy()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=window.index, y=window["price"], mode="lines", name="Price"))
+    fig.add_trace(
+        go.Bar(
+            x=window.index,
+            y=window["volume"],
+            name="Volume",
+            yaxis="y2",
+            marker_color="rgba(80, 120, 180, 0.25)",
+        )
+    )
+    fig.add_vline(x=signal_time, line_dash="dash", line_color="#111827", annotation_text="signal")
+    fig.add_vline(x=entry_time, line_dash="dot", line_color="#2563eb", annotation_text="entry")
+    fig.add_vline(x=exit_time, line_dash="dot", line_color="#dc2626", annotation_text="exit")
+    fig.update_layout(
+        title=f"Trade Audit | Net {fmt_num(trade['net_pnl_cents'])}c",
+        yaxis_title="Price",
+        yaxis2=dict(title="Volume", overlaying="y", side="right", showgrid=False),
+        height=460,
+        margin=dict(l=10, r=10, t=45, b=10),
+    )
+    return fig
+
+
 def main() -> None:
     st.title("Price Action Walk-Forward Dashboard")
     st.caption(
@@ -214,6 +250,7 @@ def main() -> None:
             "Overview",
             "Preset Search Results",
             "Rare Move Study",
+            "Spike Event Strategy",
             "Single Strategy Lab",
             "Walk-Forward Optimizer",
             "Data Diagnostics",
@@ -338,6 +375,96 @@ def main() -> None:
                 st.plotly_chart(fig, use_container_width=True)
 
     with tabs[3]:
+        st.subheader("Spike Event Strategy")
+        st.caption(
+            "Targets large price jumps like the screenshot: price moves X cents in Y seconds/minutes, "
+            "optionally confirmed by volume expansion, then holds for a longer window."
+        )
+        s1, s2, s3, s4 = st.columns(4)
+        spike_delay = s1.number_input("Spike a delay seconds", min_value=0, value=1, step=1)
+        spike_threshold = s2.number_input("Spike b cents", min_value=1.0, value=90.0, step=5.0)
+        spike_lookback = s3.number_input("Spike c seconds", min_value=1, value=180, step=10)
+        spike_hold = s4.number_input("Spike d hold seconds", min_value=1, value=14400, step=300)
+        v1, v2, v3 = st.columns(3)
+        spike_vol_window = v1.number_input("Volume baseline seconds", min_value=10, value=300, step=30)
+        spike_vol_mult = v2.number_input("Volume multiple filter", min_value=0.0, value=0.0, step=0.5)
+        spike_max_trades = v3.number_input("Spike max trades/day", min_value=1, value=1, step=1)
+        spike_params = SpikeParams(
+            int(spike_delay),
+            float(spike_threshold),
+            int(spike_lookback),
+            int(spike_hold),
+            int(spike_vol_window),
+            float(spike_vol_mult),
+            direction,
+        )
+        if st.button("Run spike preset backtest"):
+            with st.spinner("Running spike event backtest..."):
+                spike_trades, spike_daily = backtest_spike_strategy(
+                    price, spike_params, cost_cents, max_trades_per_day=int(spike_max_trades)
+                )
+                spike_metrics = compute_metrics(spike_daily, spike_trades)
+            metric_row(spike_metrics)
+            l1, l2 = st.columns(2)
+            l1.plotly_chart(equity_chart(spike_daily, "Spike Strategy Equity"), use_container_width=True)
+            l2.plotly_chart(drawdown_chart(spike_daily, "Spike Strategy Drawdown"), use_container_width=True)
+            if spike_trades.empty:
+                st.info("No spike trades fired for this preset.")
+            else:
+                st.dataframe(spike_trades.tail(250), use_container_width=True, hide_index=True)
+                pick_idx = st.slider("Audit trade index", min_value=0, max_value=len(spike_trades) - 1, value=len(spike_trades) - 1)
+                st.plotly_chart(event_audit_chart(price, spike_trades.iloc[pick_idx]), use_container_width=True)
+
+        st.markdown("**Spike Preset Optimizer**")
+        sg1, sg2 = st.columns(2)
+        spike_thresholds = parse_number_list(
+            sg1.text_input("Spike grid thresholds cents", value="50,75,100,150,200,300,400"), float
+        )
+        spike_lookbacks = parse_number_list(
+            sg2.text_input("Spike grid lookbacks seconds", value="60,300,600,900,1800"), int
+        )
+        sg3, sg4 = st.columns(2)
+        spike_holds = parse_number_list(
+            sg3.text_input("Spike grid holds seconds", value="900,1800,3600,7200,14400,21600"), int
+        )
+        spike_vol_mults = parse_number_list(sg4.text_input("Spike volume multiples", value="0,2,3"), float)
+        if st.button("Run spike 3M/1M optimizer", type="primary"):
+            spike_grid = spike_parameter_grid(
+                [int(spike_delay)],
+                spike_thresholds,
+                spike_lookbacks,
+                spike_holds,
+                [int(spike_vol_window)],
+                spike_vol_mults,
+                direction,
+            )
+            with st.spinner(f"Running {len(spike_grid):,} spike presets through 3M/1M walk-forward..."):
+                sp_details, sp_oos, sp_trades, sp_train_grid = run_spike_walk_forward(
+                    price,
+                    spike_grid,
+                    train_months=int(train_months),
+                    test_months=int(test_months),
+                    objective=objective,
+                    cost_cents=cost_cents,
+                    min_train_trades=int(min_train_trades),
+                    max_trades_per_day=int(spike_max_trades),
+                )
+            if sp_details.empty:
+                st.warning("No spike walk-forward periods produced trades.")
+            else:
+                metric_row(compute_metrics(sp_oos, sp_trades))
+                st.dataframe(sp_details, use_container_width=True, hide_index=True)
+                st.markdown("**Top Spike Train Grid Rows**")
+                st.dataframe(sp_train_grid.sort_values("score", ascending=False).head(200), use_container_width=True, hide_index=True)
+                if not sp_trades.empty:
+                    st.download_button(
+                        "Download spike OOS trades CSV",
+                        data=sp_trades.to_csv(index=False).encode("utf-8"),
+                        file_name="spike_oos_trades.csv",
+                        mime="text/csv",
+                    )
+
+    with tabs[4]:
         st.subheader("Single Parameter Backtest")
         preset = st.selectbox(
             "Preset",
@@ -393,7 +520,7 @@ def main() -> None:
             ]
             st.dataframe(trades[show_cols].tail(250), use_container_width=True, hide_index=True)
 
-    with tabs[4]:
+    with tabs[5]:
         st.subheader("Monthly Walk-Forward Optimization")
         run = st.button("Run walk-forward optimization", type="primary")
         if not run:
@@ -460,7 +587,7 @@ def main() -> None:
                         mime="text/csv",
                     )
 
-    with tabs[5]:
+    with tabs[6]:
         st.subheader("Loaded File Diagnostics")
         st.dataframe(file_stats, use_container_width=True, hide_index=True)
 
