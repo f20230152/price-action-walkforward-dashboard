@@ -15,6 +15,7 @@ from price_action_engine import (
     discover_csv_files,
     evaluate_grid,
     load_second_prices,
+    move_frequency_grid,
     parameter_grid,
     parse_number_list,
     run_walk_forward,
@@ -85,13 +86,14 @@ def make_grid_from_sidebar(direction: str) -> list[StrategyParams]:
 
 
 def metric_row(metrics: dict) -> None:
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     c1.metric("Net PnL", f"{fmt_num(metrics['total_pnl_cents'])} c")
     c2.metric("Daily Sharpe", fmt_num(metrics["daily_sharpe"]))
     c3.metric("Max DD", f"{fmt_num(metrics['max_drawdown_cents'])} c")
     c4.metric("Trades", f"{int(metrics['trades']):,}")
-    c5.metric("Win Rate", fmt_pct(metrics["win_rate"]))
-    c6.metric("Profit Factor", fmt_num(metrics["profit_factor"]))
+    c5.metric("Trades/Day", fmt_num(metrics.get("trades_per_day", 0.0), 1))
+    c6.metric("Win Rate", fmt_pct(metrics["win_rate"]))
+    c7.metric("Profit Factor", fmt_num(metrics["profit_factor"]))
 
 
 def equity_chart(daily: pd.Series, title: str) -> go.Figure:
@@ -133,7 +135,7 @@ def main() -> None:
 
         min_date = pd.to_datetime(manifest["date"].min()).date()
         max_date = pd.to_datetime(manifest["date"].max()).date()
-        default_start = max(pd.Timestamp(max_date) - pd.DateOffset(days=45), pd.Timestamp(min_date)).date()
+        default_start = max(pd.Timestamp(max_date) - pd.DateOffset(days=150), pd.Timestamp(min_date)).date()
         start_date = st.date_input("Start date", default_start, min_value=min_date, max_value=max_date)
         end_date = st.date_input("End date", max_date, min_value=min_date, max_value=max_date)
         if start_date > end_date:
@@ -141,13 +143,15 @@ def main() -> None:
             st.stop()
 
         st.header("Execution")
-        cost_cents = st.number_input(
-            "Round-trip cost in cents",
+        slippage_per_side_cents = st.number_input(
+            "Slippage per side in cents",
             min_value=0.0,
-            value=0.0,
+            value=2.0,
             step=0.1,
-            help="Applied once per completed trade, in price cents.",
+            help="A completed trade pays this once at entry and once at exit.",
         )
+        cost_cents = 2.0 * float(slippage_per_side_cents)
+        st.caption(f"Round-trip slippage applied: {fmt_num(cost_cents)} cents per completed trade.")
         direction = st.selectbox(
             "Trade direction",
             ["momentum", "fade"],
@@ -155,12 +159,12 @@ def main() -> None:
         )
 
         st.header("Grid")
-        st.text_input("a delay seconds", value="0,1", key="delay_values")
-        st.text_input("b threshold cents", value="2,5", key="threshold_values")
-        st.text_input("c move window seconds", value="10,30", key="lookback_values")
-        st.text_input("d hold seconds", value="30,60", key="hold_values")
-        min_train_trades = st.number_input("Minimum train trades", min_value=0, value=20, step=5)
-        objective_label = st.selectbox("Optimization objective", ["Daily Sharpe", "Total PnL", "Profit Factor"])
+        st.text_input("a delay seconds", value="1", key="delay_values")
+        st.text_input("b threshold cents", value="20,40,80,100", key="threshold_values")
+        st.text_input("c move window seconds", value="10,60,120", key="lookback_values")
+        st.text_input("d hold seconds", value="1800,7200,14400", key="hold_values")
+        min_train_trades = st.number_input("Minimum train trades", min_value=0, value=5, step=5)
+        objective_label = st.selectbox("Optimization objective", ["Total PnL", "Daily Sharpe", "Profit Factor"])
         objective = {
             "Daily Sharpe": "daily_sharpe",
             "Total PnL": "total_pnl_cents",
@@ -197,7 +201,7 @@ def main() -> None:
     k4.metric("Price Range", f"{fmt_num(price.min())} - {fmt_num(price.max())}")
     k5.metric("Grid Combos", f"{combo_count:,}")
 
-    tabs = st.tabs(["Overview", "Single Strategy Lab", "Walk-Forward Optimizer", "Data Diagnostics"])
+    tabs = st.tabs(["Overview", "Rare Move Study", "Single Strategy Lab", "Walk-Forward Optimizer", "Data Diagnostics"])
 
     with tabs[0]:
         c1, c2 = st.columns([2, 1])
@@ -226,17 +230,63 @@ def main() -> None:
             st.dataframe(overview, use_container_width=True, hide_index=True)
             st.markdown(
                 "<div class='small-note'>PnL is reported in price cents per one notional contract. "
-                "No slippage is assumed unless entered as round-trip cost.</div>",
+                "Slippage is applied as entry plus exit cost on every completed trade.</div>",
                 unsafe_allow_html=True,
             )
 
     with tabs[1]:
+        st.subheader("How Rare Is Each Move?")
+        st.caption(
+            "This measures every rolling x-second price change before trade filtering. "
+            "A threshold near or below 5% event-window frequency is a better starting point for sparse trading."
+        )
+        freq_lookbacks = parse_number_list(st.text_input("Frequency lookbacks seconds", value="5,10,30,60,120"), int)
+        freq_thresholds = parse_number_list(
+            st.text_input("Frequency thresholds cents", value="2,5,10,20,30,40,50,60,80,100"), float
+        )
+        if st.button("Run rare-move frequency study"):
+            with st.spinner("Scanning rolling price moves by lookback and threshold..."):
+                freq = move_frequency_grid(price, freq_lookbacks, freq_thresholds)
+            if freq.empty:
+                st.warning("No frequency rows were produced for the selected data.")
+            else:
+                display = freq.copy()
+                display["event_window_pct"] = display["event_window_pct"].map(lambda x: f"{x:.2%}")
+                st.dataframe(display, use_container_width=True, hide_index=True)
+                rare = freq[freq["event_window_pct"] <= 0.05].sort_values(
+                    ["event_window_pct", "raw_event_windows_per_day"], ascending=[False, False]
+                )
+                st.markdown("**Candidates At Or Below 5% Event-Window Frequency**")
+                st.dataframe(rare.head(100), use_container_width=True, hide_index=True)
+                fig = px.line(
+                    freq,
+                    x="threshold_cents",
+                    y="event_window_pct",
+                    color="lookback_s",
+                    markers=True,
+                    title="Event-Window Frequency By Threshold",
+                    labels={"event_window_pct": "Event window %", "threshold_cents": "Threshold cents"},
+                )
+                fig.add_hline(y=0.05, line_dash="dash", annotation_text="5% target")
+                fig.update_layout(height=420, margin=dict(l=10, r=10, t=45, b=10))
+                st.plotly_chart(fig, use_container_width=True)
+
+    with tabs[2]:
         st.subheader("Single Parameter Backtest")
+        preset = st.selectbox(
+            "Preset",
+            ["2c in 30s, hold 60s", "40c in 10s, hold 4h", "Custom"],
+            help="The first preset is the sanity-check case; the second is Shubham's rare-move idea.",
+        )
+        if preset == "40c in 10s, hold 4h":
+            default_delay, default_threshold, default_lookback, default_hold = 1, 40.0, 10, 14400
+        else:
+            default_delay, default_threshold, default_lookback, default_hold = 1, 2.0, 30, 60
         p1, p2, p3, p4 = st.columns(4)
-        delay_s = p1.number_input("a delay", min_value=0, value=1, step=1)
-        threshold_cents = p2.number_input("b cents", min_value=0.1, value=2.0, step=0.1)
-        lookback_s = p3.number_input("c seconds", min_value=1, value=30, step=1)
-        hold_s = p4.number_input("d seconds", min_value=1, value=60, step=1)
+        delay_s = p1.number_input("a delay", min_value=0, value=default_delay, step=1, key=f"delay_{preset}")
+        threshold_cents = p2.number_input("b cents", min_value=0.1, value=default_threshold, step=0.1, key=f"thr_{preset}")
+        lookback_s = p3.number_input("c seconds", min_value=1, value=default_lookback, step=1, key=f"look_{preset}")
+        hold_s = p4.number_input("d seconds", min_value=1, value=default_hold, step=1, key=f"hold_{preset}")
         params = StrategyParams(int(delay_s), float(threshold_cents), int(lookback_s), int(hold_s), direction)
 
         with st.spinner("Running single strategy backtest..."):
@@ -258,11 +308,13 @@ def main() -> None:
                 "side",
                 "entry_price",
                 "exit_price",
+                "gross_pnl_cents",
+                "cost_cents",
                 "net_pnl_cents",
             ]
             st.dataframe(trades[show_cols].tail(250), use_container_width=True, hide_index=True)
 
-    with tabs[2]:
+    with tabs[3]:
         st.subheader("Monthly Walk-Forward Optimization")
         run = st.button("Run walk-forward optimization", type="primary")
         if not run:
@@ -280,7 +332,10 @@ def main() -> None:
                 )
 
             if details.empty or oos_daily.empty:
-                st.warning("No walk-forward periods produced trades. Try lower thresholds or a wider date range.")
+                st.warning(
+                    "No walk-forward periods produced trades. This usually means the selected date range has fewer "
+                    "than train months plus test months, or every candidate failed the minimum-trade filter."
+                )
             else:
                 oos_metrics = compute_metrics(oos_daily, oos_trades)
                 metric_row(oos_metrics)
@@ -325,7 +380,7 @@ def main() -> None:
                         mime="text/csv",
                     )
 
-    with tabs[3]:
+    with tabs[4]:
         st.subheader("Loaded File Diagnostics")
         st.dataframe(file_stats, use_container_width=True, hide_index=True)
 

@@ -371,14 +371,17 @@ def compute_metrics(daily_pnl: pd.Series, trades: pd.DataFrame | None = None, tr
         "max_drawdown_cents": max_drawdown(equity),
         "positive_day_rate": float((daily > 0).mean()) if len(daily) else 0.0,
         "active_day_rate": float((daily != 0).mean()) if len(daily) else 0.0,
+        "days": int(len(daily)),
     }
 
     if trade_summary is not None:
         row.update(trade_summary)
+        row["trades_per_day"] = row["trades"] / max(row["days"], 1)
         return row
 
     if trades is None or trades.empty:
         row.update(_trade_summary([], []))
+        row["trades_per_day"] = 0.0
         return row
 
     pnl = trades["net_pnl_cents"].astype(float)
@@ -394,6 +397,7 @@ def compute_metrics(daily_pnl: pd.Series, trades: pd.DataFrame | None = None, tr
             "short_trades": int((trades["side"] < 0).sum()),
         }
     )
+    row["trades_per_day"] = row["trades"] / max(row["days"], 1)
     return row
 
 
@@ -427,6 +431,54 @@ def evaluate_grid(
             }
         )
     return pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
+
+
+def move_frequency_grid(
+    price: pd.Series,
+    lookbacks: Iterable[int],
+    thresholds: Iterable[float],
+) -> pd.DataFrame:
+    days = prepare_day_arrays(price)
+    rows = []
+    for lookback_s in sorted(set(int(x) for x in lookbacks if int(x) > 0)):
+        moves = []
+        for day in days:
+            prices = day["prices"]
+            if len(prices) <= lookback_s:
+                continue
+            delta_cents = np.abs(prices[lookback_s:] - prices[:-lookback_s]) * 100.0
+            if delta_cents.size:
+                moves.append(delta_cents)
+        if not moves:
+            continue
+
+        all_moves = np.concatenate(moves)
+        window_count = int(all_moves.size)
+        trading_days = max(len(days), 1)
+        quantiles = {
+            "p50_cents": float(np.quantile(all_moves, 0.50)),
+            "p90_cents": float(np.quantile(all_moves, 0.90)),
+            "p95_cents": float(np.quantile(all_moves, 0.95)),
+            "p98_cents": float(np.quantile(all_moves, 0.98)),
+            "p99_cents": float(np.quantile(all_moves, 0.99)),
+            "p995_cents": float(np.quantile(all_moves, 0.995)),
+            "max_cents": float(np.max(all_moves)),
+            "avg_abs_move_cents": float(np.mean(all_moves)),
+        }
+        for threshold_cents in sorted(set(float(x) for x in thresholds if float(x) > 0)):
+            event_count = int((all_moves >= threshold_cents).sum())
+            rows.append(
+                {
+                    "lookback_s": lookback_s,
+                    "threshold_cents": threshold_cents,
+                    "windows": window_count,
+                    "event_windows": event_count,
+                    "event_window_pct": event_count / window_count if window_count else 0.0,
+                    "raw_event_windows_per_day": event_count / trading_days,
+                    **quantiles,
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def run_walk_forward(

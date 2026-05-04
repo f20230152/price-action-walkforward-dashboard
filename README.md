@@ -17,7 +17,8 @@ streamlit run app.py
 
 ## Notes
 
+- Default slippage is `2` cents per side (`4` cents round-trip).
 - Momentum mode buys after an up move and sells after a down move.
 - Fade mode does the opposite.
 - The walk-forward tab optimizes on the prior N months, then runs the selected a/b/c/d settings out of sample for the next month.
-- Round-trip costs are optional and entered in cents per completed trade.
+- The rare-move tab estimates how often each `b`/`c` event happens, so thresholds can target sparse signals.
