@@ -152,6 +152,14 @@ def main() -> None:
         )
         cost_cents = 2.0 * float(slippage_per_side_cents)
         st.caption(f"Round-trip slippage applied: {fmt_num(cost_cents)} cents per completed trade.")
+        max_trades_per_day_value = st.number_input(
+            "Max trades per day",
+            min_value=1,
+            value=1,
+            step=1,
+            help="Use 1 to model taking only the first valid signal each trading day.",
+        )
+        max_trades_per_day = int(max_trades_per_day_value)
         direction = st.selectbox(
             "Trade direction",
             ["momentum", "fade"],
@@ -160,9 +168,9 @@ def main() -> None:
 
         st.header("Grid")
         st.text_input("a delay seconds", value="1", key="delay_values")
-        st.text_input("b threshold cents", value="20,40,80,100", key="threshold_values")
-        st.text_input("c move window seconds", value="10,60,120", key="lookback_values")
-        st.text_input("d hold seconds", value="1800,7200,14400", key="hold_values")
+        st.text_input("b threshold cents", value="15,40,80,90,100", key="threshold_values")
+        st.text_input("c move window seconds", value="10,90,180,300", key="lookback_values")
+        st.text_input("d hold seconds", value="10800,14400,21600", key="hold_values")
         min_train_trades = st.number_input("Minimum train trades", min_value=0, value=5, step=5)
         objective_label = st.selectbox("Optimization objective", ["Total PnL", "Daily Sharpe", "Profit Factor"])
         objective = {
@@ -201,7 +209,16 @@ def main() -> None:
     k4.metric("Price Range", f"{fmt_num(price.min())} - {fmt_num(price.max())}")
     k5.metric("Grid Combos", f"{combo_count:,}")
 
-    tabs = st.tabs(["Overview", "Rare Move Study", "Single Strategy Lab", "Walk-Forward Optimizer", "Data Diagnostics"])
+    tabs = st.tabs(
+        [
+            "Overview",
+            "Preset Search Results",
+            "Rare Move Study",
+            "Single Strategy Lab",
+            "Walk-Forward Optimizer",
+            "Data Diagnostics",
+        ]
+    )
 
     with tabs[0]:
         c1, c2 = st.columns([2, 1])
@@ -235,6 +252,55 @@ def main() -> None:
             )
 
     with tabs[1]:
+        st.subheader("Large Preset Search Results")
+        st.caption(
+            "Precomputed with 3-month train / 1-month OOS windows, momentum direction, a=1s, "
+            "2c per-side slippage, and max 1 trade/day."
+        )
+        fixed_path = APP_DIR / "preset_search_fixed_oos.csv"
+        adaptive_path = APP_DIR / "preset_search_adaptive_decisions.csv"
+        if fixed_path.exists():
+            fixed = pd.read_csv(fixed_path)
+            show_cols = [
+                "label",
+                "total_pnl_cents",
+                "daily_sharpe",
+                "max_drawdown_cents",
+                "trades",
+                "trades_per_day",
+                "win_rate",
+                "profit_factor",
+            ]
+            best_pnl = fixed.sort_values(["total_pnl_cents", "daily_sharpe"], ascending=False).iloc[0]
+            best_sharpe = fixed[fixed["trades"] >= 5].sort_values(
+                ["daily_sharpe", "total_pnl_cents"], ascending=False
+            ).iloc[0]
+            best_balanced = fixed.loc[
+                fixed.assign(rank_pnl=fixed["total_pnl_cents"].rank(ascending=False), rank_sharpe=fixed["daily_sharpe"].rank(ascending=False))
+                .eval("rank_pnl + rank_sharpe")
+                .idxmin()
+            ]
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Best PnL Preset", f"{fmt_num(best_pnl['total_pnl_cents'])} c", best_pnl["label"])
+            c2.metric("Best Sharpe Preset", fmt_num(best_sharpe["daily_sharpe"]), best_sharpe["label"])
+            c3.metric("Best Balanced Preset", f"{fmt_num(best_balanced['total_pnl_cents'])} c", best_balanced["label"])
+            st.markdown("**Top Fixed OOS Presets By Net PnL**")
+            st.dataframe(fixed[show_cols].head(100), use_container_width=True, hide_index=True)
+            st.markdown("**Top Fixed OOS Presets By Sharpe**")
+            st.dataframe(
+                fixed[fixed["trades"] >= 5].sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False)[show_cols].head(100),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("Preset search CSV is not available in this checkout.")
+
+        if adaptive_path.exists():
+            adaptive = pd.read_csv(adaptive_path)
+            st.markdown("**Adaptive 3M/1M Walk-Forward Decisions**")
+            st.dataframe(adaptive, use_container_width=True, hide_index=True)
+
+    with tabs[2]:
         st.subheader("How Rare Is Each Move?")
         st.caption(
             "This measures every rolling x-second price change before trade filtering. "
@@ -271,14 +337,27 @@ def main() -> None:
                 fig.update_layout(height=420, margin=dict(l=10, r=10, t=45, b=10))
                 st.plotly_chart(fig, use_container_width=True)
 
-    with tabs[2]:
+    with tabs[3]:
         st.subheader("Single Parameter Backtest")
         preset = st.selectbox(
             "Preset",
-            ["2c in 30s, hold 60s", "40c in 10s, hold 4h", "Custom"],
+            [
+                "Best PnL: 15c in 10s, hold 6h",
+                "Best Sharpe: 90c in 180s, hold 3h",
+                "Best Balanced: 90c in 180s, hold 4h",
+                "2c in 30s, hold 60s",
+                "40c in 10s, hold 4h",
+                "Custom",
+            ],
             help="The first preset is the sanity-check case; the second is Shubham's rare-move idea.",
         )
-        if preset == "40c in 10s, hold 4h":
+        if preset == "Best PnL: 15c in 10s, hold 6h":
+            default_delay, default_threshold, default_lookback, default_hold = 1, 15.0, 10, 21600
+        elif preset == "Best Sharpe: 90c in 180s, hold 3h":
+            default_delay, default_threshold, default_lookback, default_hold = 1, 90.0, 180, 10800
+        elif preset == "Best Balanced: 90c in 180s, hold 4h":
+            default_delay, default_threshold, default_lookback, default_hold = 1, 90.0, 180, 14400
+        elif preset == "40c in 10s, hold 4h":
             default_delay, default_threshold, default_lookback, default_hold = 1, 40.0, 10, 14400
         else:
             default_delay, default_threshold, default_lookback, default_hold = 1, 2.0, 30, 60
@@ -290,7 +369,7 @@ def main() -> None:
         params = StrategyParams(int(delay_s), float(threshold_cents), int(lookback_s), int(hold_s), direction)
 
         with st.spinner("Running single strategy backtest..."):
-            trades, daily = backtest_strategy(price, params, cost_cents)
+            trades, daily = backtest_strategy(price, params, cost_cents, max_trades_per_day=max_trades_per_day)
             metrics = compute_metrics(daily, trades)
         metric_row(metrics)
         left, right = st.columns(2)
@@ -314,7 +393,7 @@ def main() -> None:
             ]
             st.dataframe(trades[show_cols].tail(250), use_container_width=True, hide_index=True)
 
-    with tabs[3]:
+    with tabs[4]:
         st.subheader("Monthly Walk-Forward Optimization")
         run = st.button("Run walk-forward optimization", type="primary")
         if not run:
@@ -329,6 +408,7 @@ def main() -> None:
                     objective=objective,
                     cost_cents=float(cost_cents),
                     min_train_trades=int(min_train_trades),
+                    max_trades_per_day=max_trades_per_day,
                 )
 
             if details.empty or oos_daily.empty:
@@ -380,14 +460,21 @@ def main() -> None:
                         mime="text/csv",
                     )
 
-    with tabs[4]:
+    with tabs[5]:
         st.subheader("Loaded File Diagnostics")
         st.dataframe(file_stats, use_container_width=True, hide_index=True)
 
         st.subheader("Standalone Grid Scan On Full Selected Sample")
         if st.button("Run full-sample grid scan"):
             with st.spinner("Evaluating every parameter combination on the selected sample..."):
-                grid = evaluate_grid(price, params_list, objective, cost_cents, int(min_train_trades))
+                grid = evaluate_grid(
+                    price,
+                    params_list,
+                    objective,
+                    cost_cents,
+                    int(min_train_trades),
+                    max_trades_per_day=max_trades_per_day,
+                )
             st.dataframe(grid.drop(columns=["params"]).head(250), use_container_width=True, hide_index=True)
             st.download_button(
                 "Download full-sample grid CSV",

@@ -230,7 +230,13 @@ def prepare_day_arrays(price: pd.Series) -> list[dict]:
     return days
 
 
-def _scan_day(day: dict, params: StrategyParams, cost_cents: float, collect_trades: bool) -> tuple[list[dict], list[float], list[int]]:
+def _scan_day(
+    day: dict,
+    params: StrategyParams,
+    cost_cents: float,
+    collect_trades: bool,
+    max_trades_per_day: int | None = None,
+) -> tuple[list[dict], list[float], list[int]]:
     prices = day["prices"]
     times = day["times"]
     n = len(prices)
@@ -249,6 +255,8 @@ def _scan_day(day: dict, params: StrategyParams, cost_cents: float, collect_trad
     last_exit = -1
     i = 0
     while i < raw_idx.size:
+        if max_trades_per_day is not None and len(pnls) >= max_trades_per_day:
+            break
         event_idx = int(raw_idx[i])
         entry_idx = event_idx + params.delay_s
         exit_idx = entry_idx + params.hold_s
@@ -318,6 +326,7 @@ def _backtest_prepared(
     params: StrategyParams,
     cost_cents: float,
     collect_trades: bool,
+    max_trades_per_day: int | None = None,
 ) -> tuple[pd.DataFrame, pd.Series, dict]:
     if not days:
         return pd.DataFrame(), pd.Series(dtype=float, name="daily_pnl_cents"), _trade_summary([], [])
@@ -329,7 +338,7 @@ def _backtest_prepared(
     daily_index = []
 
     for day in days:
-        trades, pnls, sides = _scan_day(day, params, cost_cents, collect_trades)
+        trades, pnls, sides = _scan_day(day, params, cost_cents, collect_trades, max_trades_per_day)
         if collect_trades and trades:
             all_trades.extend(trades)
         all_pnls.extend(pnls)
@@ -342,9 +351,14 @@ def _backtest_prepared(
     return trades_df, daily, _trade_summary(all_pnls, all_sides)
 
 
-def backtest_strategy(price: pd.Series, params: StrategyParams, cost_cents: float = 0.0) -> tuple[pd.DataFrame, pd.Series]:
+def backtest_strategy(
+    price: pd.Series,
+    params: StrategyParams,
+    cost_cents: float = 0.0,
+    max_trades_per_day: int | None = None,
+) -> tuple[pd.DataFrame, pd.Series]:
     days = prepare_day_arrays(price)
-    trades, daily, _ = _backtest_prepared(days, params, cost_cents, collect_trades=True)
+    trades, daily, _ = _backtest_prepared(days, params, cost_cents, collect_trades=True, max_trades_per_day=max_trades_per_day)
     return trades, daily
 
 
@@ -407,11 +421,18 @@ def evaluate_grid(
     objective: str,
     cost_cents: float,
     min_trades: int,
+    max_trades_per_day: int | None = None,
 ) -> pd.DataFrame:
     rows = []
     days = prepare_day_arrays(price)
     for params in params_list:
-        _, daily, summary = _backtest_prepared(days, params, cost_cents, collect_trades=False)
+        _, daily, summary = _backtest_prepared(
+            days,
+            params,
+            cost_cents,
+            collect_trades=False,
+            max_trades_per_day=max_trades_per_day,
+        )
         metrics = compute_metrics(daily, trade_summary=summary)
         if metrics["trades"] < min_trades:
             score = -np.inf
@@ -489,6 +510,7 @@ def run_walk_forward(
     objective: str = "daily_sharpe",
     cost_cents: float = 0.0,
     min_train_trades: int = 20,
+    max_trades_per_day: int | None = None,
 ) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.DataFrame]:
     price = price.dropna().sort_index()
     if price.empty:
@@ -512,7 +534,7 @@ def run_walk_forward(
         if train_price.empty or test_price.empty:
             continue
 
-        grid = evaluate_grid(train_price, params_list, objective, cost_cents, min_train_trades)
+        grid = evaluate_grid(train_price, params_list, objective, cost_cents, min_train_trades, max_trades_per_day)
         grid = grid.copy()
         grid["train_start"] = str(train_periods[0])
         grid["train_end"] = str(train_periods[-1])
@@ -526,7 +548,7 @@ def run_walk_forward(
 
         best_row = finite.iloc[0]
         best_params = best_row["params"]
-        test_trades, test_daily = backtest_strategy(test_price, best_params, cost_cents)
+        test_trades, test_daily = backtest_strategy(test_price, best_params, cost_cents, max_trades_per_day)
         test_metrics = compute_metrics(test_daily, test_trades)
         all_test_daily.append(test_daily)
         if not test_trades.empty:
