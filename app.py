@@ -73,7 +73,7 @@ def cached_manifest(data_dir: str) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=True, persist=True)
-def cached_prices(data_dir: str, start_date: str, end_date: str) -> tuple[pd.Series, pd.DataFrame]:
+def cached_prices(data_dir: str, start_date: str, end_date: str, cache_version: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     return load_second_prices(
         data_dir,
         pd.to_datetime(start_date),
@@ -220,10 +220,14 @@ def main() -> None:
         test_months = st.number_input("Test months", min_value=1, max_value=6, value=1, step=1)
 
     with st.spinner("Loading and normalizing tick files to 1-second prices..."):
-        price, file_stats = cached_prices(data_dir, str(start_date), str(end_date))
+        price, file_stats = cached_prices(data_dir, str(start_date), str(end_date), "v3-price-volume")
+    if isinstance(price, pd.Series):
+        price = price.to_frame("price")
+        price["volume"] = 0.0
     if price.empty:
         st.error("No valid price rows were loaded for the selected date range.")
         st.stop()
+    price_px = price["price"] if isinstance(price, pd.DataFrame) else price
 
     params_list = make_grid_from_sidebar(direction)
     if not params_list:
@@ -242,7 +246,7 @@ def main() -> None:
     k1.metric("Files Loaded", f"{len(selected_files):,}")
     k2.metric("Trading Days", f"{loaded_days:,}")
     k3.metric("1s Rows", f"{len(price):,}")
-    k4.metric("Price Range", f"{fmt_num(price.min())} - {fmt_num(price.max())}")
+    k4.metric("Price Range", f"{fmt_num(price_px.min())} - {fmt_num(price_px.max())}")
     k5.metric("Grid Combos", f"{combo_count:,}")
 
     tabs = st.tabs(

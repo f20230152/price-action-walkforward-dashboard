@@ -287,6 +287,9 @@ def prepare_day_arrays(price: pd.Series | pd.DataFrame) -> list[dict]:
 
 
 def prepare_spike_day_arrays(bars: pd.DataFrame) -> list[dict]:
+    if isinstance(bars, pd.Series):
+        bars = bars.to_frame("price")
+        bars["volume"] = 0.0
     bars = bars.dropna(subset=["price"]).sort_index()
     if "volume" not in bars.columns:
         bars = bars.copy()
@@ -537,7 +540,7 @@ def _backtest_spike_prepared(
 
 
 def backtest_spike_strategy(
-    bars: pd.DataFrame,
+    bars: pd.DataFrame | pd.Series,
     params: SpikeParams,
     cost_cents: float = 0.0,
     max_trades_per_day: int | None = 1,
@@ -548,7 +551,7 @@ def backtest_spike_strategy(
 
 
 def evaluate_spike_grid(
-    bars: pd.DataFrame,
+    bars: pd.DataFrame | pd.Series,
     params_list: list[SpikeParams],
     objective: str,
     cost_cents: float,
@@ -817,7 +820,7 @@ def run_walk_forward(
 
 
 def run_spike_walk_forward(
-    bars: pd.DataFrame,
+    bars: pd.DataFrame | pd.Series,
     params_list: list[SpikeParams],
     train_months: int = 3,
     test_months: int = 1,
@@ -826,6 +829,9 @@ def run_spike_walk_forward(
     min_train_trades: int = 1,
     max_trades_per_day: int | None = 1,
 ) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.DataFrame]:
+    if isinstance(bars, pd.Series):
+        bars = bars.to_frame("price")
+        bars["volume"] = 0.0
     bars = bars.dropna(subset=["price"]).sort_index()
     if bars.empty:
         return pd.DataFrame(), pd.Series(dtype=float), pd.DataFrame(), pd.DataFrame()
