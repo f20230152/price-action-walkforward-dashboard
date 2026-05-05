@@ -176,6 +176,40 @@ def event_audit_chart(bars: pd.DataFrame, trade: pd.Series, minutes_before: int 
     return fig
 
 
+def walkforward_gate_summary(metrics: pd.Series, decisions: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
+    pnl_months = int((decisions["test_total_pnl_cents"] > 0).sum()) if not decisions.empty else 0
+    total_months = int(len(decisions))
+    rows = [
+        {
+            "Check": "Walk-forward Sharpe >= 1.0",
+            "Value": fmt_num(float(metrics.get("daily_sharpe", 0.0))),
+            "Pass": float(metrics.get("daily_sharpe", 0.0)) >= 1.0,
+        },
+        {
+            "Check": "Walk-forward net PnL > 0",
+            "Value": f"{fmt_num(float(metrics.get('total_pnl_cents', 0.0)))} c",
+            "Pass": float(metrics.get("total_pnl_cents", 0.0)) > 0,
+        },
+        {
+            "Check": "At least 20 OOS trades",
+            "Value": f"{int(metrics.get('trades', 0))}",
+            "Pass": int(metrics.get("trades", 0)) >= 20,
+        },
+        {
+            "Check": "Positive in majority of test months",
+            "Value": f"{pnl_months}/{total_months}",
+            "Pass": total_months > 0 and pnl_months / total_months >= 0.5,
+        },
+        {
+            "Check": "Max drawdown better than -500c",
+            "Value": f"{fmt_num(float(metrics.get('max_drawdown_cents', 0.0)))} c",
+            "Pass": float(metrics.get("max_drawdown_cents", 0.0)) >= -500.0,
+        },
+    ]
+    out = pd.DataFrame(rows)
+    return out, bool(out["Pass"].all())
+
+
 def main() -> None:
     st.title("Price Action Walk-Forward Dashboard")
     st.caption(
@@ -315,11 +349,34 @@ def main() -> None:
             )
 
     with tabs[1]:
-        st.subheader("Large Preset Search Results")
+        st.subheader("Walk-Forward First Selection")
         st.caption(
-            "Precomputed with 3-month train / 1-month OOS windows, momentum direction, a=1s, "
-            "2c per-side slippage, and max 1 trade/day."
+            "Primary selection follows Shubham's rule: only consider candidates that hold up in 3-month train / "
+            "1-month out-of-sample walk-forward. Fixed backtests below are diagnostics only."
         )
+        iterative_dir = APP_DIR / "outputs" / "iterative_spike_search"
+        refined_adaptive_path = iterative_dir / "stage3_quick_refine_adaptive_decisions.csv"
+        refined_metrics_path = iterative_dir / "stage3_quick_refine_adaptive_metrics.csv"
+        if refined_metrics_path.exists() and refined_adaptive_path.exists():
+            wf_metrics = pd.read_csv(refined_metrics_path).iloc[0]
+            wf_decisions = pd.read_csv(refined_adaptive_path)
+            gates, passed = walkforward_gate_summary(wf_metrics, wf_decisions)
+            st.success("Primary WF candidate passes validation gates.") if passed else st.warning(
+                "Primary WF candidate does not pass every validation gate."
+            )
+            metric_row(wf_metrics.to_dict())
+            st.markdown("**Walk-Forward Validation Gates**")
+            gates_display = gates.copy()
+            gates_display["Pass"] = gates_display["Pass"].map(lambda x: "PASS" if x else "FAIL")
+            st.dataframe(gates_display, use_container_width=True, hide_index=True)
+            st.markdown("**3M Train / 1M Test Decisions Used For Selection**")
+            st.dataframe(wf_decisions, use_container_width=True, hide_index=True)
+        else:
+            st.info("Walk-forward refinement outputs are not available in this checkout.")
+
+        st.divider()
+        st.subheader("Fixed Backtest Diagnostics")
+        st.caption("These tables help explain parameter pockets, but they are not the primary selection criterion.")
         fixed_path = APP_DIR / "preset_search_fixed_oos.csv"
         adaptive_path = APP_DIR / "preset_search_adaptive_decisions.csv"
         if fixed_path.exists():
@@ -360,16 +417,13 @@ def main() -> None:
 
         if adaptive_path.exists():
             adaptive = pd.read_csv(adaptive_path)
-            st.markdown("**Adaptive 3M/1M Walk-Forward Decisions**")
+            st.markdown("**Earlier Adaptive 3M/1M Walk-Forward Decisions**")
             st.dataframe(adaptive, use_container_width=True, hide_index=True)
 
-        iterative_dir = APP_DIR / "outputs" / "iterative_spike_search"
         refined_path = iterative_dir / "stage2_quick_refine_fixed_oos.csv"
-        refined_adaptive_path = iterative_dir / "stage3_quick_refine_adaptive_decisions.csv"
-        refined_metrics_path = iterative_dir / "stage3_quick_refine_adaptive_metrics.csv"
         if refined_path.exists():
             refined = pd.read_csv(refined_path)
-            st.markdown("**Iterative Spike Search: Refined Time Buckets**")
+            st.markdown("**Refined Fixed OOS Diagnostics: Time-Bucket Deep Dive**")
             st.caption(
                 "Coarse scan identified winning buckets, then a finer grid searched inside those ranges. "
                 "All rows use 2c per-side slippage and max 1 trade/day."
@@ -385,13 +439,9 @@ def main() -> None:
                 ["rank_pnl", "rank_sharpe", "rank_dd"], ascending=True
             ).iloc[0]
             r1, r2, r3 = st.columns(3)
-            r1.metric("Refined Best PnL", f"{fmt_num(best_refined_pnl['total_pnl_cents'])} c", best_refined_pnl["label"])
-            r2.metric("Refined Best Sharpe", fmt_num(best_refined_sharpe["daily_sharpe"]), best_refined_sharpe["label"])
-            r3.metric(
-                "Refined Balanced",
-                f"{fmt_num(best_refined_balanced['total_pnl_cents'])} c",
-                best_refined_balanced["label"],
-            )
+            r1.metric("Diagnostic Best PnL", f"{fmt_num(best_refined_pnl['total_pnl_cents'])} c", best_refined_pnl["label"])
+            r2.metric("Diagnostic Best Sharpe", fmt_num(best_refined_sharpe["daily_sharpe"]), best_refined_sharpe["label"])
+            r3.metric("Diagnostic Balanced", f"{fmt_num(best_refined_balanced['total_pnl_cents'])} c", best_refined_balanced["label"])
             st.markdown("**Refined Fixed OOS: Top By Net PnL**")
             st.dataframe(refined[show_cols].head(100), use_container_width=True, hide_index=True)
             st.markdown("**Refined Fixed OOS: Top By Sharpe**")
@@ -402,12 +452,6 @@ def main() -> None:
                 use_container_width=True,
                 hide_index=True,
             )
-        if refined_metrics_path.exists():
-            st.markdown("**Refined Adaptive 3M/1M Metrics**")
-            st.dataframe(pd.read_csv(refined_metrics_path), use_container_width=True, hide_index=True)
-        if refined_adaptive_path.exists():
-            st.markdown("**Refined Adaptive 3M/1M Decisions**")
-            st.dataframe(pd.read_csv(refined_adaptive_path), use_container_width=True, hide_index=True)
 
     with tabs[2]:
         st.subheader("How Rare Is Each Move?")
@@ -541,20 +585,20 @@ def main() -> None:
         preset = st.selectbox(
             "Preset",
             [
-                "Best PnL: 15c in 10s, hold 6h",
-                "Best Sharpe: 90c in 180s, hold 3h",
-                "Best Balanced: 90c in 180s, hold 4h",
+                "Diagnostic PnL: 15c in 10s, hold 6h",
+                "Diagnostic Sharpe: 90c in 180s, hold 3h",
+                "Diagnostic Balanced: 90c in 180s, hold 4h",
                 "2c in 30s, hold 60s",
                 "40c in 10s, hold 4h",
                 "Custom",
             ],
             help="The first preset is the sanity-check case; the second is Shubham's rare-move idea.",
         )
-        if preset == "Best PnL: 15c in 10s, hold 6h":
+        if preset == "Diagnostic PnL: 15c in 10s, hold 6h":
             default_delay, default_threshold, default_lookback, default_hold = 1, 15.0, 10, 21600
-        elif preset == "Best Sharpe: 90c in 180s, hold 3h":
+        elif preset == "Diagnostic Sharpe: 90c in 180s, hold 3h":
             default_delay, default_threshold, default_lookback, default_hold = 1, 90.0, 180, 10800
-        elif preset == "Best Balanced: 90c in 180s, hold 4h":
+        elif preset == "Diagnostic Balanced: 90c in 180s, hold 4h":
             default_delay, default_threshold, default_lookback, default_hold = 1, 90.0, 180, 14400
         elif preset == "40c in 10s, hold 4h":
             default_delay, default_threshold, default_lookback, default_hold = 1, 40.0, 10, 14400
