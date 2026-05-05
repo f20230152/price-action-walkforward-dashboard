@@ -341,6 +341,52 @@ def main() -> None:
             st.markdown("**Adaptive 3M/1M Walk-Forward Decisions**")
             st.dataframe(adaptive, use_container_width=True, hide_index=True)
 
+        iterative_dir = APP_DIR / "outputs" / "iterative_spike_search"
+        refined_path = iterative_dir / "stage2_quick_refine_fixed_oos.csv"
+        refined_adaptive_path = iterative_dir / "stage3_quick_refine_adaptive_decisions.csv"
+        refined_metrics_path = iterative_dir / "stage3_quick_refine_adaptive_metrics.csv"
+        if refined_path.exists():
+            refined = pd.read_csv(refined_path)
+            st.markdown("**Iterative Spike Search: Refined Time Buckets**")
+            st.caption(
+                "Coarse scan identified winning buckets, then a finer grid searched inside those ranges. "
+                "All rows use 2c per-side slippage and max 1 trade/day."
+            )
+            best_refined_pnl = refined.sort_values(["total_pnl_cents", "daily_sharpe"], ascending=False).iloc[0]
+            best_refined_sharpe = refined[refined["trades"] >= 5].sort_values(
+                ["daily_sharpe", "total_pnl_cents"], ascending=False
+            ).iloc[0]
+            refined["rank_pnl"] = refined["total_pnl_cents"].rank(ascending=False)
+            refined["rank_sharpe"] = refined["daily_sharpe"].rank(ascending=False)
+            refined["rank_dd"] = refined["max_drawdown_cents"].abs().rank(ascending=True)
+            best_refined_balanced = refined.sort_values(
+                ["rank_pnl", "rank_sharpe", "rank_dd"], ascending=True
+            ).iloc[0]
+            r1, r2, r3 = st.columns(3)
+            r1.metric("Refined Best PnL", f"{fmt_num(best_refined_pnl['total_pnl_cents'])} c", best_refined_pnl["label"])
+            r2.metric("Refined Best Sharpe", fmt_num(best_refined_sharpe["daily_sharpe"]), best_refined_sharpe["label"])
+            r3.metric(
+                "Refined Balanced",
+                f"{fmt_num(best_refined_balanced['total_pnl_cents'])} c",
+                best_refined_balanced["label"],
+            )
+            st.markdown("**Refined Fixed OOS: Top By Net PnL**")
+            st.dataframe(refined[show_cols].head(100), use_container_width=True, hide_index=True)
+            st.markdown("**Refined Fixed OOS: Top By Sharpe**")
+            st.dataframe(
+                refined[refined["trades"] >= 5]
+                .sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False)[show_cols]
+                .head(100),
+                use_container_width=True,
+                hide_index=True,
+            )
+        if refined_metrics_path.exists():
+            st.markdown("**Refined Adaptive 3M/1M Metrics**")
+            st.dataframe(pd.read_csv(refined_metrics_path), use_container_width=True, hide_index=True)
+        if refined_adaptive_path.exists():
+            st.markdown("**Refined Adaptive 3M/1M Decisions**")
+            st.dataframe(pd.read_csv(refined_adaptive_path), use_container_width=True, hide_index=True)
+
     with tabs[2]:
         st.subheader("How Rare Is Each Move?")
         st.caption(
@@ -385,10 +431,10 @@ def main() -> None:
             "optionally confirmed by volume expansion, then holds for a longer window."
         )
         s1, s2, s3, s4 = st.columns(4)
-        spike_delay = s1.number_input("Spike a delay seconds", min_value=0, value=1, step=1)
-        spike_threshold = s2.number_input("Spike b cents", min_value=1.0, value=90.0, step=5.0)
-        spike_lookback = s3.number_input("Spike c seconds", min_value=1, value=180, step=10)
-        spike_hold = s4.number_input("Spike d hold seconds", min_value=1, value=14400, step=300)
+        spike_delay = s1.number_input("Spike a delay seconds", min_value=0, value=7, step=1)
+        spike_threshold = s2.number_input("Spike b cents", min_value=1.0, value=77.5, step=2.5)
+        spike_lookback = s3.number_input("Spike c seconds", min_value=1, value=75, step=5)
+        spike_hold = s4.number_input("Spike d hold seconds", min_value=1, value=16200, step=300)
         v1, v2, v3 = st.columns(3)
         spike_vol_window = v1.number_input("Volume baseline seconds", min_value=10, value=300, step=30)
         spike_vol_mult = v2.number_input("Volume multiple filter", min_value=0.0, value=0.0, step=0.5)
@@ -422,16 +468,16 @@ def main() -> None:
         st.markdown("**Spike Preset Optimizer**")
         sg1, sg2 = st.columns(2)
         spike_thresholds = parse_number_list(
-            sg1.text_input("Spike grid thresholds cents", value="50,75,100,150,200,300,400"), float
+            sg1.text_input("Spike grid thresholds cents", value="65,70,72.5,75,77.5,80,85"), float
         )
         spike_lookbacks = parse_number_list(
-            sg2.text_input("Spike grid lookbacks seconds", value="60,300,600,900,1800"), int
+            sg2.text_input("Spike grid lookbacks seconds", value="45,60,75,90"), int
         )
         sg3, sg4 = st.columns(2)
         spike_holds = parse_number_list(
-            sg3.text_input("Spike grid holds seconds", value="900,1800,3600,7200,14400,21600"), int
+            sg3.text_input("Spike grid holds seconds", value="12600,14400,16200,18000"), int
         )
-        spike_vol_mults = parse_number_list(sg4.text_input("Spike volume multiples", value="0,2,3"), float)
+        spike_vol_mults = parse_number_list(sg4.text_input("Spike volume multiples", value="0,2"), float)
         if st.button("Run spike 3M/1M optimizer", type="primary"):
             spike_grid = spike_parameter_grid(
                 [int(spike_delay)],
