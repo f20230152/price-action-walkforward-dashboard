@@ -141,9 +141,31 @@ def event_audit_chart(bars: pd.DataFrame, trade: pd.Series, minutes_before: int 
             marker_color="rgba(80, 120, 180, 0.25)",
         )
     )
-    fig.add_vline(x=signal_time, line_dash="dash", line_color="#111827", annotation_text="signal")
-    fig.add_vline(x=entry_time, line_dash="dot", line_color="#2563eb", annotation_text="entry")
-    fig.add_vline(x=exit_time, line_dash="dot", line_color="#dc2626", annotation_text="exit")
+    markers = [
+        (signal_time.to_pydatetime(), "signal", "#111827", "dash"),
+        (entry_time.to_pydatetime(), "entry", "#2563eb", "dot"),
+        (exit_time.to_pydatetime(), "exit", "#dc2626", "dot"),
+    ]
+    for x_value, label, color, dash in markers:
+        fig.add_shape(
+            type="line",
+            x0=x_value,
+            x1=x_value,
+            y0=0,
+            y1=1,
+            xref="x",
+            yref="paper",
+            line=dict(color=color, dash=dash, width=2),
+        )
+        fig.add_annotation(
+            x=x_value,
+            y=1.02,
+            xref="x",
+            yref="paper",
+            text=label,
+            showarrow=False,
+            font=dict(color=color, size=11),
+        )
     fig.update_layout(
         title=f"Trade Audit | Net {fmt_num(trade['net_pnl_cents'])}c",
         yaxis_title="Price",
