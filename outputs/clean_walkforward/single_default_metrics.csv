@@ -1,0 +1,2 @@
+total_pnl_cents,avg_daily_pnl_cents,daily_sharpe,daily_sortino,max_drawdown_cents,positive_day_rate,active_day_rate,days,trades,win_rate,avg_trade_cents,profit_factor,long_trades,short_trades,trades_per_day,params,cost_cents,max_trades_per_day
+2667.9999999999973,18.02702702702701,2.617570672413239,3.7207926468102013,-274.99999999999864,0.17567567567567569,0.27702702702702703,148,41,0.6341463414634146,65.07317073170726,3.2571912013536335,21,20,0.27702702702702703,a=120s | move=75c/1800s | hold=21600s | vol off | momentum,4.0,1
