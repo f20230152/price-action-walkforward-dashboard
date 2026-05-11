@@ -226,6 +226,44 @@ def single_equity_figure(daily: pd.Series, title: str) -> go.Figure:
     return fig
 
 
+def _prep_excluded_for_analysis(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    for col in ["signal_time", "signal_time_dubai", "entry_time", "exit_time"]:
+        if col in out.columns:
+            out[col] = pd.to_datetime(out[col], errors="coerce")
+    out["net_pnl_cents"] = pd.to_numeric(out["net_pnl_cents"], errors="coerce").fillna(0.0)
+    out["gross_pnl_cents"] = pd.to_numeric(out["gross_pnl_cents"], errors="coerce").fillna(0.0)
+    out["cost_cents"] = pd.to_numeric(out["cost_cents"], errors="coerce").fillna(0.0)
+    if "signal_time_dubai" in out.columns:
+        out["dubai_hour"] = out["signal_time_dubai"].dt.hour
+        out["dubai_month"] = out["signal_time_dubai"].dt.to_period("M").astype(str)
+    else:
+        out["dubai_hour"] = pd.NA
+        out["dubai_month"] = ""
+    out["side_label"] = out["side"].map({1: "LONG", -1: "SHORT"}) if "side" in out.columns else ""
+    return out
+
+
+def _excluded_summary(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    grouped = (
+        df.groupby(group_cols, dropna=False)
+        .agg(
+            trades=("net_pnl_cents", "size"),
+            net_pnl_cents=("net_pnl_cents", "sum"),
+            gross_pnl_cents=("gross_pnl_cents", "sum"),
+            total_cost_cents=("cost_cents", "sum"),
+            avg_trade_cents=("net_pnl_cents", "mean"),
+            win_rate=("net_pnl_cents", lambda x: float((x > 0).mean())),
+        )
+        .reset_index()
+    )
+    return grouped.sort_values("net_pnl_cents", ascending=False)
+
+
 def render_walk_forward_tab(data: dict[str, pd.DataFrame]) -> None:
     st.caption(
         "Parameters are selected using the prior 3 months and traded on the next unseen month. "
@@ -533,13 +571,135 @@ def render_single_backtest_tab() -> None:
         st.dataframe(excluded_out[[c for c in excluded_cols if c in excluded_out.columns]], use_container_width=True, hide_index=True)
 
 
+def render_out_of_session_tab(data: dict[str, pd.DataFrame]) -> None:
+    st.caption(
+        "Trades here are signals that did not match the allowed Dubai-time window: 11:00 to 24:00. "
+        "They show what was excluded by the time filter."
+    )
+    wf_excluded = _prep_excluded_for_analysis(data["out_of_session"])
+    metrics = data["metrics"]
+    single_default = load_default_single_backtest()
+    single_excluded = _prep_excluded_for_analysis(single_default[1]) if single_default is not None else pd.DataFrame()
+
+    source_options = ["Walk-forward excluded trades"]
+    if not single_excluded.empty:
+        source_options.append("Single-parameter default excluded trades")
+    source = st.selectbox("Source", source_options)
+    if source.startswith("Single"):
+        df = single_excluded.copy()
+        active_label = single_default[4] if single_default is not None else ""
+        in_window_pnl = float(single_default[3].get("total_pnl_cents", 0.0)) if single_default is not None else 0.0
+        st.code(active_label)
+    else:
+        if wf_excluded.empty:
+            st.info("No walk-forward trades were excluded by the Dubai-time filter.")
+            return
+        selectors = sorted(wf_excluded["selector_objective"].dropna().unique().tolist())
+        selector = st.selectbox("Selector objective", selectors, index=selectors.index("daily_sharpe") if "daily_sharpe" in selectors else 0)
+        df = wf_excluded[wf_excluded["selector_objective"] == selector].copy()
+        metric_row = metrics[metrics["selector_objective"] == selector]
+        in_window_pnl = float(metric_row["total_pnl_cents"].iloc[0]) if not metric_row.empty else 0.0
+
+    if df.empty:
+        st.info("No excluded trades for this selection.")
+        return
+
+    excluded_pnl = float(df["net_pnl_cents"].sum())
+    excluded_gross = float(df["gross_pnl_cents"].sum())
+    excluded_cost = float(df["cost_cents"].sum())
+    combined_pnl = in_window_pnl + excluded_pnl
+    pnl_word = "profit missed" if excluded_pnl > 0 else "loss avoided"
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Excluded Trades", f"{len(df):,}")
+    c2.metric("Excluded Net PnL", f"{fmt_num(excluded_pnl)} c")
+    c3.metric("Impact", pnl_word)
+    c4.metric("In-Window PnL", f"{fmt_num(in_window_pnl)} c")
+    c5.metric("If Included", f"{fmt_num(combined_pnl)} c")
+    c6.metric("Excluded Costs", f"{fmt_num(excluded_cost)} c")
+
+    st.caption(
+        f"Interpretation: excluding these trades changed PnL by {fmt_num(excluded_pnl)}c. "
+        f"Positive means profit was left out; negative means the time filter avoided a loss."
+    )
+
+    summary_cols = st.columns(2)
+    by_month = _excluded_summary(df, ["dubai_month"])
+    by_hour = _excluded_summary(df, ["dubai_hour"])
+    with summary_cols[0]:
+        st.subheader("Excluded PnL By Month")
+        st.dataframe(by_month, use_container_width=True, hide_index=True)
+    with summary_cols[1]:
+        st.subheader("Excluded PnL By Dubai Hour")
+        st.dataframe(by_hour, use_container_width=True, hide_index=True)
+
+    if not by_hour.empty:
+        hour_fig = px.bar(
+            by_hour,
+            x="dubai_hour",
+            y="net_pnl_cents",
+            color="net_pnl_cents",
+            color_continuous_scale="RdYlGn",
+            title="Excluded Net PnL By Dubai Signal Hour",
+            labels={"dubai_hour": "Dubai signal hour", "net_pnl_cents": "Net PnL cents"},
+        )
+        hour_fig.update_layout(height=360, margin=dict(l=10, r=10, t=45, b=10))
+        st.plotly_chart(hour_fig, use_container_width=True)
+
+    side_summary = _excluded_summary(df, ["side_label"])
+    param_summary = _excluded_summary(df, ["selected_params"]) if "selected_params" in df.columns else pd.DataFrame()
+    c_left, c_right = st.columns(2)
+    with c_left:
+        st.subheader("Long Vs Short")
+        st.dataframe(side_summary, use_container_width=True, hide_index=True)
+    with c_right:
+        st.subheader("Parameter Set Impact")
+        if param_summary.empty:
+            st.info("No parameter labels available for this source.")
+        else:
+            st.dataframe(param_summary, use_container_width=True, hide_index=True)
+
+    st.subheader("Excluded Trade List")
+    display_cols = [
+        "selector_objective",
+        "test_month",
+        "signal_time",
+        "signal_time_dubai",
+        "dubai_hour",
+        "out_of_frame_category",
+        "entry_time",
+        "exit_time",
+        "side_label",
+        "move_cents",
+        "entry_price",
+        "exit_price",
+        "gross_pnl_cents",
+        "cost_cents",
+        "net_pnl_cents",
+        "selected_params",
+        "exclusion_reason",
+    ]
+    shown = df[[c for c in display_cols if c in df.columns]].sort_values("signal_time_dubai")
+    st.dataframe(shown, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download Excluded Trades CSV",
+        data=shown.to_csv(index=False).encode("utf-8"),
+        file_name="excluded_out_of_session_trades.csv",
+        mime="text/csv",
+    )
+
+
 def main() -> None:
     st.title("Price Action Research Dashboard")
     data = load_outputs()
 
-    walk_forward_tab, single_tab = st.tabs(["Walk-Forward", "Single Parameter Backtest"])
+    walk_forward_tab, excluded_tab, single_tab = st.tabs(
+        ["Walk-Forward", "Out-Of-Session Analysis", "Single Parameter Backtest"]
+    )
     with walk_forward_tab:
         render_walk_forward_tab(data)
+    with excluded_tab:
+        render_out_of_session_tab(data)
     with single_tab:
         render_single_backtest_tab()
 
