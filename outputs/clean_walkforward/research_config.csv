@@ -1,2 +1,2 @@
-data_start,data_end,days,raw_files,candidate_count,train_months,test_months,cost_cents_round_trip,max_trades_per_day,min_train_trades
-2025-10-01 00:00:00,2026-03-26 16:06:23,148,127,6048,3,1,4.0,1,5
+data_start,data_end,days,raw_files,candidate_count,train_months,test_months,cost_model,cost_formula,cost_cents_round_trip,bid_ask_cost_cents_per_price_unit,session_timezone,session_start_hour,session_end_hour,max_trades_per_day,refresh_method
+2025-10-01 00:00:00,2026-03-26 16:06:23,148,127,,3,1,dynamic_absolute_price_level,round-trip cost cents = abs(entry_price) * 0.04,,0.04,Dubai UTC+4,11,24,1,existing_selected_walkforward_params_retested_with_session_and_dynamic_cost

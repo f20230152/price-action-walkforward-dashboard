@@ -46,11 +46,14 @@ def main() -> None:
     decisions = read_csv("walkforward_decisions_all.csv")
     trades = read_csv("walkforward_trades_all.csv")
     daily = read_csv("walkforward_daily_pnl_all.csv")
+    out_of_session = read_csv("walkforward_out_of_session_trades_all.csv")
     universe = read_csv("parameter_universe.csv")
     config = read_csv("research_config.csv")
-    rankings = read_csv("walkforward_train_rankings_all.csv")
 
     best = metrics.sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False).iloc[0]
+    candidate_count = ""
+    if not config.empty and "candidate_count" in config.columns and pd.notna(config["candidate_count"].iloc[0]):
+        candidate_count = int(config["candidate_count"].iloc[0])
     summary = pd.DataFrame(
         [
             ["Recommended selector", best["selector_objective"]],
@@ -61,9 +64,11 @@ def main() -> None:
             ["WF Trades/Day", best["trades_per_day"]],
             ["WF Win Rate", best["win_rate"]],
             ["WF Profit Factor", best["profit_factor"]],
-            ["Candidate universe size", int(config["candidate_count"].iloc[0]) if not config.empty else ""],
+            ["Candidate universe size", candidate_count],
             ["Train/Test", "3 months train / 1 month test"],
-            ["Cost", "2c per side / 4c round trip"],
+            ["Cost", "Dynamic bid/ask: round-trip cents = abs(entry price) * 0.04"],
+            ["Trading window", "11:00 to 24:00 Dubai time; signal time must be inside"],
+            ["Excluded out-of-frame trades", len(out_of_session)],
             ["Trade cap", "1 trade/day"],
         ],
         columns=["Metric", "Value"],
@@ -81,11 +86,11 @@ def main() -> None:
         metrics.to_excel(writer, sheet_name="WF Metrics", index=False)
         decisions.to_excel(writer, sheet_name="WF Decisions", index=False)
         trades.to_excel(writer, sheet_name="WF Trades", index=False)
+        out_of_session.to_excel(writer, sheet_name="Excluded Trades", index=False)
         daily.to_excel(writer, sheet_name="Daily PnL", index=False)
         equity.to_excel(writer, sheet_name="Equity Curves", index=False)
         config.to_excel(writer, sheet_name="Research Config", index=False)
         universe.to_excel(writer, sheet_name="Parameter Universe", index=False)
-        rankings.to_excel(writer, sheet_name="Train Rankings", index=False)
 
     wb = load_workbook(XLSX_PATH)
     for ws in wb.worksheets:

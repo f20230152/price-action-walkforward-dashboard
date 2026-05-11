@@ -7,7 +7,14 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from price_action_engine import SpikeParams, backtest_spike_strategy, compute_metrics, load_second_prices
+from price_action_engine import (
+    DUBAI_UTC_OFFSET_HOURS,
+    DYNAMIC_COST_CENTS_PER_PRICE_UNIT,
+    SpikeParams,
+    backtest_spike_strategy,
+    compute_metrics,
+    load_second_prices,
+)
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -15,6 +22,7 @@ DATA_DIR = APP_DIR / "data"
 OUT_DIR = APP_DIR / "outputs" / "clean_walkforward"
 REPORT_XLSX = OUT_DIR / "walkforward_report.xlsx"
 SINGLE_DEFAULT_TRADES = OUT_DIR / "single_default_trades.csv"
+SINGLE_DEFAULT_EXCLUDED = OUT_DIR / "single_default_out_of_session_trades.csv"
 SINGLE_DEFAULT_DAILY = OUT_DIR / "single_default_daily.csv"
 SINGLE_DEFAULT_METRICS = OUT_DIR / "single_default_metrics.csv"
 DEFAULT_SINGLE_PARAMS = SpikeParams(
@@ -26,8 +34,9 @@ DEFAULT_SINGLE_PARAMS = SpikeParams(
     volume_multiple=0.0,
     direction="momentum",
 )
-DEFAULT_COST_CENTS = 4.0
 DEFAULT_MAX_TRADES_PER_DAY = 1
+SESSION_START_HOUR_DUBAI = 11
+SESSION_END_HOUR_DUBAI = 24
 
 
 st.set_page_config(
@@ -57,6 +66,7 @@ def load_outputs() -> dict[str, pd.DataFrame]:
         "decisions": "walkforward_decisions_all.csv",
         "trades": "walkforward_trades_all.csv",
         "daily": "walkforward_daily_pnl_all.csv",
+        "out_of_session": "walkforward_out_of_session_trades_all.csv",
         "config": "research_config.csv",
         "universe": "parameter_universe.csv",
         "rankings": "walkforward_train_rankings_all.csv",
@@ -68,20 +78,44 @@ def load_outputs() -> dict[str, pd.DataFrame]:
     return out
 
 
+def add_session_audit_columns(trades: pd.DataFrame) -> pd.DataFrame:
+    if trades.empty:
+        return trades
+    out = trades.copy()
+    signal = pd.to_datetime(out["signal_time"])
+    signal_dubai = signal + pd.Timedelta(hours=DUBAI_UTC_OFFSET_HOURS)
+    out["signal_time_dubai"] = signal_dubai
+    seconds = signal_dubai.dt.hour * 3600 + signal_dubai.dt.minute * 60 + signal_dubai.dt.second
+    start_seconds = SESSION_START_HOUR_DUBAI * 3600
+    end_seconds = SESSION_END_HOUR_DUBAI * 3600
+    inside = (seconds >= start_seconds) & (seconds < end_seconds)
+    out["session_bucket"] = inside.map(
+        {
+            True: f"Inside {SESSION_START_HOUR_DUBAI:02d}:00-24:00 Dubai",
+            False: f"Outside {SESSION_START_HOUR_DUBAI:02d}:00-24:00 Dubai",
+        }
+    )
+    out["out_of_frame_category"] = inside.map({True: "Tradable session", False: "Excluded: before 11:00 Dubai"})
+    return out
+
+
 @st.cache_data(show_spinner=False)
-def load_default_single_backtest() -> tuple[pd.DataFrame, pd.Series, dict, str] | None:
+def load_default_single_backtest() -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, dict, str] | None:
     if not (SINGLE_DEFAULT_TRADES.exists() and SINGLE_DEFAULT_DAILY.exists() and SINGLE_DEFAULT_METRICS.exists()):
         return None
     trades = pd.read_csv(SINGLE_DEFAULT_TRADES)
+    excluded = pd.read_csv(SINGLE_DEFAULT_EXCLUDED) if SINGLE_DEFAULT_EXCLUDED.exists() else pd.DataFrame()
     for col in ["signal_time", "entry_time", "exit_time"]:
         if col in trades.columns:
             trades[col] = pd.to_datetime(trades[col])
+        if col in excluded.columns:
+            excluded[col] = pd.to_datetime(excluded[col])
     daily_df = pd.read_csv(SINGLE_DEFAULT_DAILY, index_col=0, parse_dates=True)
     daily = daily_df.iloc[:, 0].rename("daily_pnl_cents") if not daily_df.empty else pd.Series(dtype=float)
     metrics_row = pd.read_csv(SINGLE_DEFAULT_METRICS).iloc[0]
     label = str(metrics_row["params"])
     metrics = metrics_row.drop(labels=["params"], errors="ignore").to_dict()
-    return trades, daily, metrics, label
+    return trades, excluded, daily, metrics, label
 
 
 @st.cache_data(show_spinner=False)
@@ -102,12 +136,11 @@ def run_single_backtest(
     threshold_cents: float,
     lookback_s: int,
     hold_s: int,
-    cost_cents: float,
     max_trades_per_day: int,
     volume_multiple: float,
     volume_window_s: int,
     direction: str,
-) -> tuple[pd.DataFrame, pd.Series, dict, str]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, dict, str]:
     bars = load_price_bars()
     params = SpikeParams(
         delay_s=int(delay_s),
@@ -119,9 +152,26 @@ def run_single_backtest(
         direction=str(direction),
     )
     cap = None if int(max_trades_per_day) <= 0 else int(max_trades_per_day)
-    trades, daily = backtest_spike_strategy(bars, params, float(cost_cents), cap)
+    trades, daily = backtest_spike_strategy(
+        bars,
+        params,
+        None,
+        cap,
+        session_start_hour=SESSION_START_HOUR_DUBAI,
+        session_end_hour=SESSION_END_HOUR_DUBAI,
+        session_tz_offset_hours=DUBAI_UTC_OFFSET_HOURS,
+    )
+    unrestricted_trades, _ = backtest_spike_strategy(bars, params, None, cap)
+    unrestricted_trades = add_session_audit_columns(unrestricted_trades)
+    excluded = (
+        unrestricted_trades[unrestricted_trades["session_bucket"].str.startswith("Outside")].copy()
+        if not unrestricted_trades.empty
+        else pd.DataFrame()
+    )
+    if not excluded.empty:
+        excluded["exclusion_reason"] = f"Signal outside {SESSION_START_HOUR_DUBAI:02d}:00-24:00 Dubai tradable window"
     metrics = compute_metrics(daily, trades)
-    return trades, daily, metrics, params.label
+    return trades, excluded, daily, metrics, params.label
 
 
 def metric_tiles(row: pd.Series) -> None:
@@ -187,7 +237,6 @@ def render_walk_forward_tab(data: dict[str, pd.DataFrame]) -> None:
     daily = data["daily"]
     config = data["config"]
     universe = data["universe"]
-    rankings = data["rankings"]
 
     if metrics.empty or decisions.empty:
         st.error("Clean walk-forward outputs are missing. Run `python clean_walkforward_research.py` first.")
@@ -205,11 +254,21 @@ def render_walk_forward_tab(data: dict[str, pd.DataFrame]) -> None:
     cfg_cols = st.columns(5)
     if not config.empty:
         cfg = config.iloc[0]
-        cfg_cols[0].metric("Candidate Universe", f"{int(cfg['candidate_count']):,}")
+        candidate_count = cfg.get("candidate_count", "")
+        cfg_cols[0].metric(
+            "Candidate Universe",
+            f"{int(candidate_count):,}" if pd.notna(candidate_count) and candidate_count != "" else "Selected WF",
+        )
         cfg_cols[1].metric("Train Window", f"{int(cfg['train_months'])}M")
         cfg_cols[2].metric("Test/Rebalance", f"{int(cfg['test_months'])}M")
-        cfg_cols[3].metric("Round Trip Cost", f"{fmt_num(cfg['cost_cents_round_trip'])} c")
+        cost_label = (
+            cfg.get("cost_formula", f"abs(entry_price) * {DYNAMIC_COST_CENTS_PER_PRICE_UNIT:g} cents")
+            if "cost_formula" in cfg.index
+            else f"abs(entry_price) * {DYNAMIC_COST_CENTS_PER_PRICE_UNIT:g} cents"
+        )
+        cfg_cols[3].metric("Bid/Ask Cost", "Dynamic")
         cfg_cols[4].metric("Trade Cap", f"{int(cfg['max_trades_per_day'])}/day")
+        st.caption(f"Trading window: 11:00 to 24:00 Dubai time. Cost model: {cost_label}.")
 
     if REPORT_XLSX.exists():
         st.download_button(
@@ -268,8 +327,12 @@ def render_walk_forward_tab(data: dict[str, pd.DataFrame]) -> None:
         display_cols = [
             "test_month",
             "signal_time",
+            "signal_time_dubai",
             "entry_time",
+            "entry_time_dubai",
             "exit_time",
+            "exit_time_dubai",
+            "session_bucket",
             "side",
             "move_cents",
             "signal_volume",
@@ -288,11 +351,35 @@ def render_walk_forward_tab(data: dict[str, pd.DataFrame]) -> None:
             mime="text/csv",
         )
 
-    with st.expander("Parameter Universe And Train Rankings"):
-        st.markdown("The universe below was defined before the monthly tests. Each test month only uses its own prior 3-month train window.")
+    out_of_session = data["out_of_session"]
+    selected_out = out_of_session[out_of_session["selector_objective"] == selector].copy() if not out_of_session.empty else pd.DataFrame()
+    st.subheader("Excluded Out-Of-Frame Trades")
+    st.caption("These are trades that the same selected parameters would have taken without the Dubai-time restriction.")
+    if selected_out.empty:
+        st.info("No out-of-frame trades were removed for this selector.")
+    else:
+        out_cols = [
+            "test_month",
+            "signal_time",
+            "signal_time_dubai",
+            "out_of_frame_category",
+            "entry_time",
+            "exit_time",
+            "side",
+            "move_cents",
+            "entry_price",
+            "exit_price",
+            "gross_pnl_cents",
+            "cost_cents",
+            "net_pnl_cents",
+            "selected_params",
+            "exclusion_reason",
+        ]
+        st.dataframe(selected_out[[c for c in out_cols if c in selected_out.columns]], use_container_width=True, hide_index=True)
+
+    with st.expander("Parameter Universe"):
+        st.markdown("The universe below was defined before the monthly tests. Displayed performance and trades use the Dubai-time window and dynamic bid/ask cost.")
         st.dataframe(universe, use_container_width=True, hide_index=True)
-        st.markdown("Top train-window rankings saved during each rebalance:")
-        st.dataframe(rankings, use_container_width=True, hide_index=True)
 
 
 def render_single_backtest_tab() -> None:
@@ -315,22 +402,22 @@ def render_single_backtest_tab() -> None:
         hold_s = r1[3].number_input("Hold time (seconds)", min_value=1, value=DEFAULT_SINGLE_PARAMS.hold_s, step=1)
 
         r2 = st.columns(4)
-        cost_cents = r2[0].number_input("Round-trip cost/slippage (cents)", min_value=0.0, value=DEFAULT_COST_CENTS, step=0.5)
-        max_trades_per_day = r2[1].number_input(
+        max_trades_per_day = r2[0].number_input(
             "Max trades per day",
             min_value=0,
             value=DEFAULT_MAX_TRADES_PER_DAY,
             step=1,
             help="Set 0 for unlimited trades per day.",
         )
-        volume_multiple = r2[2].number_input(
+        volume_multiple = r2[1].number_input(
             "Volume multiple filter",
             min_value=0.0,
             value=float(DEFAULT_SINGLE_PARAMS.volume_multiple),
             step=0.5,
             help="0 means volume filter off.",
         )
-        direction = r2[3].selectbox("Direction", options=["momentum", "fade"], index=0)
+        direction = r2[2].selectbox("Direction", options=["momentum", "fade"], index=0)
+        r2[3].metric("Bid/Ask Cost", f"{DYNAMIC_COST_CENTS_PER_PRICE_UNIT:g}c x price")
 
         volume_window_s = st.number_input(
             "Volume baseline window (seconds)",
@@ -345,16 +432,15 @@ def render_single_backtest_tab() -> None:
         if default_result is None:
             st.info("Click Run Single Backtest to calculate the whole-period trade list for these parameters.")
             return
-        trades, daily, metrics, label = default_result
+        trades, excluded, daily, metrics, label = default_result
         st.info("Showing the saved whole-period run for Shubham's default parameters. Click Run Single Backtest after changing inputs.")
     else:
         with st.spinner("Running whole-period single-parameter backtest..."):
-            trades, daily, metrics, label = run_single_backtest(
+            trades, excluded, daily, metrics, label = run_single_backtest(
                 int(delay_s),
                 float(threshold_cents),
                 int(lookback_s),
                 int(hold_s),
-                float(cost_cents),
                 int(max_trades_per_day),
                 float(volume_multiple),
                 int(volume_window_s),
@@ -396,8 +482,12 @@ def render_single_backtest_tab() -> None:
     out_trades["params"] = label
     display_cols = [
         "signal_time",
+        "signal_time_dubai",
         "entry_time",
+        "entry_time_dubai",
         "exit_time",
+        "exit_time_dubai",
+        "session_bucket",
         "side_label",
         "move_cents",
         "signal_volume",
@@ -415,6 +505,32 @@ def render_single_backtest_tab() -> None:
         file_name="single_parameter_whole_period_trades.csv",
         mime="text/csv",
     )
+
+    st.subheader("Excluded Out-Of-Frame Trades")
+    st.caption("These trades are from the same parameters without the 11:00-24:00 Dubai signal-time filter.")
+    if excluded.empty:
+        st.info("No unrestricted trades fell outside the Dubai-time window.")
+    else:
+        excluded_out = excluded.copy()
+        excluded_out["side_label"] = excluded_out["side"].map({1: "LONG", -1: "SHORT"})
+        excluded_out["params"] = label
+        excluded_cols = [
+            "signal_time",
+            "signal_time_dubai",
+            "out_of_frame_category",
+            "entry_time",
+            "exit_time",
+            "side_label",
+            "move_cents",
+            "entry_price",
+            "exit_price",
+            "gross_pnl_cents",
+            "cost_cents",
+            "net_pnl_cents",
+            "params",
+            "exclusion_reason",
+        ]
+        st.dataframe(excluded_out[[c for c in excluded_cols if c in excluded_out.columns]], use_container_width=True, hide_index=True)
 
 
 def main() -> None:

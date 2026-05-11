@@ -15,6 +15,8 @@ import pandas as pd
 DATE_FILE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.csv$")
 EPS = 1e-12
 CACHE_VERSION = "v3"
+DUBAI_UTC_OFFSET_HOURS = 4
+DYNAMIC_COST_CENTS_PER_PRICE_UNIT = 0.04
 
 
 @dataclass(frozen=True)
@@ -296,10 +298,16 @@ def prepare_spike_day_arrays(bars: pd.DataFrame) -> list[dict]:
         bars["volume"] = 0.0
     days = []
     for date, day_bars in bars.groupby(bars.index.normalize(), sort=True):
+        dubai_index = day_bars.index + pd.Timedelta(hours=DUBAI_UTC_OFFSET_HOURS)
         days.append(
             {
                 "date": pd.Timestamp(date),
                 "times": day_bars.index.to_numpy(),
+                "dubai_seconds": (
+                    dubai_index.hour.to_numpy() * 3600
+                    + dubai_index.minute.to_numpy() * 60
+                    + dubai_index.second.to_numpy()
+                ),
                 "prices": day_bars["price"].to_numpy(dtype=float),
                 "volume": day_bars["volume"].fillna(0.0).to_numpy(dtype=float),
             }
@@ -377,13 +385,17 @@ def _scan_day(
 def _scan_spike_day(
     day: dict,
     params: SpikeParams,
-    cost_cents: float,
+    cost_cents: float | None,
     collect_trades: bool,
     max_trades_per_day: int | None = 1,
+    session_start_hour: int | None = None,
+    session_end_hour: int | None = None,
+    session_tz_offset_hours: int = DUBAI_UTC_OFFSET_HOURS,
 ) -> tuple[list[dict], list[float], list[int]]:
     prices = day["prices"]
     volume = day["volume"]
     times = day["times"]
+    dubai_seconds = day.get("dubai_seconds")
     n = len(prices)
     min_required = params.lookback_s + params.delay_s + params.hold_s + 1
     if n <= min_required:
@@ -395,15 +407,31 @@ def _scan_spike_day(
         return [], [], []
 
     if params.volume_multiple > 0:
-        vol = pd.Series(volume)
-        recent_vol = vol.rolling(params.lookback_s, min_periods=1).sum().to_numpy()
-        baseline_vol = vol.rolling(params.volume_window_s, min_periods=max(1, min(params.volume_window_s, 30))).mean().to_numpy()
+        recent_vol = _rolling_sum_min1(volume, params.lookback_s)
+        baseline_vol = _rolling_mean(volume, params.volume_window_s, max(1, min(params.volume_window_s, 30)))
         required = params.volume_multiple * baseline_vol * max(params.lookback_s, 1)
         raw_idx = raw_idx[recent_vol[raw_idx] >= required[raw_idx]]
         if raw_idx.size == 0:
             return [], [], []
     else:
-        recent_vol = pd.Series(volume).rolling(params.lookback_s, min_periods=1).sum().to_numpy()
+        recent_vol = _rolling_sum_min1(volume, params.lookback_s) if collect_trades else None
+
+    if session_start_hour is not None and session_end_hour is not None:
+        if dubai_seconds is not None and int(session_tz_offset_hours) == DUBAI_UTC_OFFSET_HOURS:
+            seconds = dubai_seconds[raw_idx]
+        else:
+            session_times = pd.DatetimeIndex(times[raw_idx]) + pd.Timedelta(hours=int(session_tz_offset_hours))
+            seconds = session_times.hour * 3600 + session_times.minute * 60 + session_times.second
+        start_seconds = int(session_start_hour) * 3600
+        end_hour = int(session_end_hour)
+        end_seconds = 24 * 3600 if end_hour >= 24 else end_hour * 3600
+        if start_seconds < end_seconds:
+            keep = (seconds >= start_seconds) & (seconds < end_seconds)
+        else:
+            keep = (seconds >= start_seconds) | (seconds < end_seconds)
+        raw_idx = raw_idx[keep]
+        if raw_idx.size == 0:
+            return [], [], []
 
     trades = []
     pnls = []
@@ -418,6 +446,7 @@ def _scan_spike_day(
         exit_idx = entry_idx + params.hold_s
         if exit_idx >= n:
             break
+        signal_time = pd.Timestamp(times[event_idx])
         if entry_idx <= last_exit:
             i = int(np.searchsorted(raw_idx, last_exit - params.delay_s + 1, side="left"))
             continue
@@ -430,22 +459,29 @@ def _scan_spike_day(
         entry_price = prices[entry_idx]
         exit_price = prices[exit_idx]
         gross_cents = side * (exit_price - entry_price) * 100.0
-        net_cents = gross_cents - cost_cents
+        trade_cost_cents = _resolve_trade_cost_cents(cost_cents, entry_price)
+        net_cents = gross_cents - trade_cost_cents
         pnls.append(float(net_cents))
         sides.append(side)
         if collect_trades:
+            entry_time = pd.Timestamp(times[entry_idx])
+            exit_time = pd.Timestamp(times[exit_idx])
             trades.append(
                 {
-                    "signal_time": pd.Timestamp(times[event_idx]),
-                    "entry_time": pd.Timestamp(times[entry_idx]),
-                    "exit_time": pd.Timestamp(times[exit_idx]),
+                    "signal_time": signal_time,
+                    "signal_time_dubai": _to_session_time(signal_time, session_tz_offset_hours),
+                    "entry_time": entry_time,
+                    "entry_time_dubai": _to_session_time(entry_time, session_tz_offset_hours),
+                    "exit_time": exit_time,
+                    "exit_time_dubai": _to_session_time(exit_time, session_tz_offset_hours),
+                    "session_bucket": _session_bucket(signal_time, session_start_hour, session_end_hour, session_tz_offset_hours),
                     "side": side,
                     "move_cents": move * 100.0,
-                    "signal_volume": float(recent_vol[event_idx]),
+                    "signal_volume": float(recent_vol[event_idx]) if recent_vol is not None else 0.0,
                     "entry_price": entry_price,
                     "exit_price": exit_price,
                     "gross_pnl_cents": gross_cents,
-                    "cost_cents": cost_cents,
+                    "cost_cents": trade_cost_cents,
                     "net_pnl_cents": net_cents,
                 }
             )
@@ -453,6 +489,74 @@ def _scan_spike_day(
         i = int(np.searchsorted(raw_idx, last_exit - params.delay_s + 1, side="left"))
 
     return trades, pnls, sides
+
+
+def _to_session_time(ts: pd.Timestamp, tz_offset_hours: int) -> pd.Timestamp:
+    return pd.Timestamp(ts) + pd.Timedelta(hours=int(tz_offset_hours))
+
+
+def _rolling_sum_min1(values: np.ndarray, window: int) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return arr
+    window = max(int(window), 1)
+    cumsum = np.cumsum(arr)
+    out = cumsum.copy()
+    if window < arr.size:
+        out[window:] = cumsum[window:] - cumsum[:-window]
+    return out
+
+
+def _rolling_mean(values: np.ndarray, window: int, min_periods: int) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return arr
+    window = max(int(window), 1)
+    min_periods = max(int(min_periods), 1)
+    sums = _rolling_sum_min1(arr, window)
+    counts = np.minimum(np.arange(1, arr.size + 1), window).astype(float)
+    out = sums / counts
+    out[counts < min_periods] = np.nan
+    return out
+
+
+def _is_in_session(
+    ts: pd.Timestamp,
+    session_start_hour: int | None,
+    session_end_hour: int | None,
+    session_tz_offset_hours: int,
+) -> bool:
+    if session_start_hour is None or session_end_hour is None:
+        return True
+    session_ts = _to_session_time(pd.Timestamp(ts), session_tz_offset_hours)
+    seconds = session_ts.hour * 3600 + session_ts.minute * 60 + session_ts.second
+    start_seconds = int(session_start_hour) * 3600
+    end_hour = int(session_end_hour)
+    end_seconds = 24 * 3600 if end_hour >= 24 else end_hour * 3600
+    if start_seconds < end_seconds:
+        return start_seconds <= seconds < end_seconds
+    return seconds >= start_seconds or seconds < end_seconds
+
+
+def _session_bucket(
+    ts: pd.Timestamp,
+    session_start_hour: int | None,
+    session_end_hour: int | None,
+    session_tz_offset_hours: int,
+) -> str:
+    if session_start_hour is None or session_end_hour is None:
+        return "Unrestricted"
+    return (
+        f"Inside {session_start_hour:02d}:00-24:00 Dubai"
+        if _is_in_session(ts, session_start_hour, session_end_hour, session_tz_offset_hours)
+        else f"Outside {session_start_hour:02d}:00-24:00 Dubai"
+    )
+
+
+def _resolve_trade_cost_cents(cost_cents: float | None, entry_price: float) -> float:
+    if cost_cents is None:
+        return float(abs(entry_price) * DYNAMIC_COST_CENTS_PER_PRICE_UNIT)
+    return float(cost_cents)
 
 
 def _trade_summary(pnls: list[float], sides: list[int]) -> dict:
@@ -512,9 +616,12 @@ def _backtest_prepared(
 def _backtest_spike_prepared(
     days: list[dict],
     params: SpikeParams,
-    cost_cents: float,
+    cost_cents: float | None,
     collect_trades: bool,
     max_trades_per_day: int | None = 1,
+    session_start_hour: int | None = None,
+    session_end_hour: int | None = None,
+    session_tz_offset_hours: int = DUBAI_UTC_OFFSET_HOURS,
 ) -> tuple[pd.DataFrame, pd.Series, dict]:
     if not days:
         return pd.DataFrame(), pd.Series(dtype=float, name="daily_pnl_cents"), _trade_summary([], [])
@@ -526,7 +633,16 @@ def _backtest_spike_prepared(
     daily_index = []
 
     for day in days:
-        trades, pnls, sides = _scan_spike_day(day, params, cost_cents, collect_trades, max_trades_per_day)
+        trades, pnls, sides = _scan_spike_day(
+            day,
+            params,
+            cost_cents,
+            collect_trades,
+            max_trades_per_day,
+            session_start_hour,
+            session_end_hour,
+            session_tz_offset_hours,
+        )
         if collect_trades and trades:
             all_trades.extend(trades)
         all_pnls.extend(pnls)
@@ -542,11 +658,23 @@ def _backtest_spike_prepared(
 def backtest_spike_strategy(
     bars: pd.DataFrame | pd.Series,
     params: SpikeParams,
-    cost_cents: float = 0.0,
+    cost_cents: float | None = 0.0,
     max_trades_per_day: int | None = 1,
+    session_start_hour: int | None = None,
+    session_end_hour: int | None = None,
+    session_tz_offset_hours: int = DUBAI_UTC_OFFSET_HOURS,
 ) -> tuple[pd.DataFrame, pd.Series]:
     days = prepare_spike_day_arrays(bars)
-    trades, daily, _ = _backtest_spike_prepared(days, params, cost_cents, True, max_trades_per_day)
+    trades, daily, _ = _backtest_spike_prepared(
+        days,
+        params,
+        cost_cents,
+        True,
+        max_trades_per_day,
+        session_start_hour,
+        session_end_hour,
+        session_tz_offset_hours,
+    )
     return trades, daily
 
 
@@ -554,14 +682,26 @@ def evaluate_spike_grid(
     bars: pd.DataFrame | pd.Series,
     params_list: list[SpikeParams],
     objective: str,
-    cost_cents: float,
+    cost_cents: float | None,
     min_trades: int,
     max_trades_per_day: int | None = 1,
+    session_start_hour: int | None = None,
+    session_end_hour: int | None = None,
+    session_tz_offset_hours: int = DUBAI_UTC_OFFSET_HOURS,
 ) -> pd.DataFrame:
     rows = []
     days = prepare_spike_day_arrays(bars)
     for params in params_list:
-        _, daily, summary = _backtest_spike_prepared(days, params, cost_cents, False, max_trades_per_day)
+        _, daily, summary = _backtest_spike_prepared(
+            days,
+            params,
+            cost_cents,
+            False,
+            max_trades_per_day,
+            session_start_hour,
+            session_end_hour,
+            session_tz_offset_hours,
+        )
         metrics = compute_metrics(daily, trade_summary=summary)
         score = -np.inf if metrics["trades"] < min_trades else float(metrics.get(objective, metrics["total_pnl_cents"]))
         rows.append(
