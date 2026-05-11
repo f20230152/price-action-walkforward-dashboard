@@ -340,6 +340,7 @@ def render_walk_forward_tab(data: dict[str, pd.DataFrame]) -> None:
         "Selector objective",
         options=show_metrics["selector_objective"].tolist(),
         index=0,
+        key="walk_forward_selector_objective",
     )
     selected_decisions = decisions[decisions["selector_objective"] == selector].copy()
     st.dataframe(selected_decisions, use_container_width=True, hide_index=True)
@@ -584,7 +585,7 @@ def render_out_of_session_tab(data: dict[str, pd.DataFrame]) -> None:
     source_options = ["Walk-forward excluded trades"]
     if not single_excluded.empty:
         source_options.append("Single-parameter default excluded trades")
-    source = st.selectbox("Source", source_options)
+    source = st.selectbox("Source", source_options, key="out_of_session_source")
     if source.startswith("Single"):
         df = single_excluded.copy()
         active_label = single_default[4] if single_default is not None else ""
@@ -595,7 +596,12 @@ def render_out_of_session_tab(data: dict[str, pd.DataFrame]) -> None:
             st.info("No walk-forward trades were excluded by the Dubai-time filter.")
             return
         selectors = sorted(wf_excluded["selector_objective"].dropna().unique().tolist())
-        selector = st.selectbox("Selector objective", selectors, index=selectors.index("daily_sharpe") if "daily_sharpe" in selectors else 0)
+        selector = st.selectbox(
+            "Selector objective",
+            selectors,
+            index=selectors.index("daily_sharpe") if "daily_sharpe" in selectors else 0,
+            key="out_of_session_selector_objective",
+        )
         df = wf_excluded[wf_excluded["selector_objective"] == selector].copy()
         metric_row = metrics[metrics["selector_objective"] == selector]
         in_window_pnl = float(metric_row["total_pnl_cents"].iloc[0]) if not metric_row.empty else 0.0
