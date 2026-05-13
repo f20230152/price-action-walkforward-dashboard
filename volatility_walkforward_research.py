@@ -301,19 +301,10 @@ def _trade_summary(pnls: list[float], sides: list[int]) -> dict:
 def period_schedule(bars: pd.DataFrame, rebalance: str) -> list[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]]:
     start = pd.Timestamp("2026-01-01")
     end = bars.index.max().normalize()
-    if rebalance == "monthly":
-        starts = pd.date_range(start, end, freq="MS")
-        test_ends = [min(s + pd.DateOffset(months=1) - pd.Timedelta(days=1), end) for s in starts]
-    elif rebalance == "weekly":
-        starts = pd.date_range(start, end, freq="W-MON")
-        if starts.empty or starts[0] > start:
-            starts = pd.DatetimeIndex([start]).append(starts)
-        test_ends = [min(s + pd.Timedelta(days=6), end) for s in starts]
-    elif rebalance == "daily":
-        starts = pd.DatetimeIndex(sorted(bars[bars.index >= start].index.normalize().unique()))
-        test_ends = list(starts)
-    else:
+    if rebalance != "monthly":
         raise ValueError(rebalance)
+    starts = pd.date_range(start, end, freq="MS")
+    test_ends = [min(s + pd.DateOffset(months=1) - pd.Timedelta(days=1), end) for s in starts]
 
     schedule = []
     for test_start, test_end in zip(starts, test_ends):
