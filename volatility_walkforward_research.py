@@ -74,6 +74,14 @@ def build_universe() -> list[VolParams]:
     ]
 
 
+def objective_slug(objective: str) -> str:
+    if objective == "daily_sharpe":
+        return "sharpe_objective"
+    if objective == "total_pnl_cents":
+        return "pnl_objective"
+    return objective
+
+
 def add_volatility_columns(bars: pd.DataFrame) -> pd.DataFrame:
     out = bars.copy()
     daily_close = out["price"].groupby(out.index.normalize()).last().sort_index()
@@ -601,7 +609,7 @@ def main() -> None:
                 print("running", vol_method, rebalance, objective, "candidates", len(method_params), flush=True)
                 decisions, trades, daily, rankings = run_walkforward_cached(cache, bars, method_params, rebalance, objective)
                 metrics = compute_metrics(daily, trades)
-                run_key = f"{vol_method}_{rebalance}_{objective}"
+                run_key = f"{vol_method}_{rebalance}_{objective_slug(objective)}"
                 all_metrics.append({"run_key": run_key, "vol_method": vol_method, "rebalance": rebalance, "objective": objective, **metrics})
                 if not decisions.empty:
                     decisions["run_key"] = run_key

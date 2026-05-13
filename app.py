@@ -133,7 +133,7 @@ def load_outputs() -> dict[str, pd.DataFrame]:
     return out
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=30)
 def load_vol_outputs() -> dict[str, pd.DataFrame]:
     files = {
         "metrics": "metrics.csv",
