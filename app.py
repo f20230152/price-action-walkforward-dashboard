@@ -83,6 +83,17 @@ def clean_label(value: str) -> str:
 
 def display_table(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    out = out.drop(
+        columns=[
+            "trades_per_day",
+            "positive_day_rate",
+            "active_day_rate",
+            "avg_daily_pnl_cents",
+            "daily_sortino",
+            "days",
+        ],
+        errors="ignore",
+    )
     for col in ["selector_objective", "objective"]:
         if col in out.columns:
             out[col] = out[col].map(objective_label)
@@ -97,6 +108,8 @@ def display_table(df: pd.DataFrame) -> pd.DataFrame:
             "avg_daily_pnl_cents": "avg_pnl_cents",
             "daily_sortino": "sortino",
             "daily_sigma_dollars": "rolling_sigma_dollars",
+            "vol_window_days": "vol_window_sessions",
+            "max_trades_per_day": "max_trades_per_session",
         }
     )
 
@@ -235,23 +248,21 @@ def run_single_backtest(
 
 
 def metric_tiles(row: pd.Series) -> None:
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("WF Net PnL", f"{fmt_num(row['total_pnl_cents'])} c")
     c2.metric("WF Sharpe", fmt_num(row["daily_sharpe"]))
     c3.metric("Max DD", f"{fmt_num(row['max_drawdown_cents'])} c")
     c4.metric("Trades", f"{int(row['trades']):,}")
-    c5.metric("Trades/Day", fmt_num(row["trades_per_day"], 2))
-    c6.metric("Profit Factor", fmt_num(row["profit_factor"]))
+    c5.metric("Profit Factor", fmt_num(row["profit_factor"]))
 
 
 def single_metric_tiles(metrics: dict) -> None:
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Net PnL", f"{fmt_num(metrics['total_pnl_cents'])} c")
     c2.metric("Sharpe", fmt_num(metrics["daily_sharpe"]))
     c3.metric("Max DD", f"{fmt_num(metrics['max_drawdown_cents'])} c")
     c4.metric("Trades", f"{int(metrics['trades']):,}")
-    c5.metric("Trades/Day", fmt_num(metrics["trades_per_day"], 2))
-    c6.metric("Profit Factor", fmt_num(metrics["profit_factor"]))
+    c5.metric("Profit Factor", fmt_num(metrics["profit_factor"]))
 
 
 def equity_figure(daily: pd.DataFrame) -> go.Figure:
@@ -365,7 +376,7 @@ def render_walk_forward_tab(data: dict[str, pd.DataFrame]) -> None:
             else f"abs(entry_price) * {DYNAMIC_COST_CENTS_PER_PRICE_UNIT:g} cents"
         )
         cfg_cols[3].metric("Bid/Ask Cost", "Dynamic")
-        cfg_cols[4].metric("Trade Cap", f"{int(cfg['max_trades_per_day'])}/day")
+        cfg_cols[4].metric("Trade Cap", f"{int(cfg['max_trades_per_day'])} per session")
         st.caption(f"Trading window: 11:00 to 24:00 Dubai time. Cost model: {cost_label}.")
 
     if REPORT_XLSX.exists():
@@ -385,7 +396,6 @@ def render_walk_forward_tab(data: dict[str, pd.DataFrame]) -> None:
             "daily_sharpe",
             "max_drawdown_cents",
             "trades",
-            "trades_per_day",
             "win_rate",
             "profit_factor",
         ]
@@ -485,8 +495,8 @@ def render_walk_forward_tab(data: dict[str, pd.DataFrame]) -> None:
 def render_volatility_tab(vol_data: dict[str, pd.DataFrame], fixed_data: dict[str, pd.DataFrame], vol_method: str) -> None:
     title = "Dollar Sigma" if vol_method == "dollar" else "Percent Vol Converted To Dollar Sigma"
     st.caption(
-        f"{title}: threshold = rolling 63 trading-day sigma x optimized multiple. "
-        "The optimizer now uses monthly rebalance only, a 63 trading-day volatility lookback with a 21-day early warm-up, "
+        f"{title}: threshold = rolling 63-session sigma x optimized multiple. "
+        "The optimizer now uses monthly rebalance only, a 63-session volatility lookback with a 21-session early warm-up, "
         "both signal directions, and a hard Dubai midnight exit."
     )
     metrics = vol_data["metrics"]
@@ -547,7 +557,6 @@ def render_volatility_tab(vol_data: dict[str, pd.DataFrame], fixed_data: dict[st
             "daily_sharpe",
             "max_drawdown_cents",
             "trades",
-            "trades_per_day",
             "win_rate",
             "profit_factor",
         ]
@@ -656,11 +665,11 @@ def render_single_backtest_tab() -> None:
 
         r2 = st.columns(4)
         max_trades_per_day = r2[0].number_input(
-            "Max trades per day",
+            "Max trades per session",
             min_value=0,
             value=DEFAULT_MAX_TRADES_PER_DAY,
             step=1,
-            help="Set 0 for unlimited trades per day.",
+            help="Set 0 for unlimited trades.",
         )
         volume_multiple = r2[1].number_input(
             "Volume multiple filter",
@@ -706,7 +715,7 @@ def render_single_backtest_tab() -> None:
     single_metric_tiles(metrics)
 
     if daily.empty:
-        st.warning("No days were available for this backtest.")
+        st.warning("No data was available for this backtest.")
         return
 
     st.plotly_chart(single_equity_figure(daily, "Whole-Period Single Backtest Equity"), use_container_width=True)
