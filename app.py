@@ -60,6 +60,47 @@ def fmt_pct(x: float) -> str:
     return f"{float(x):.1%}"
 
 
+def objective_label(value: str) -> str:
+    labels = {
+        "daily_sharpe": "Sharpe objective",
+        "total_pnl_cents": "PnL objective",
+        "profit_factor": "Profit factor objective",
+    }
+    return labels.get(str(value), str(value))
+
+
+def clean_label(value: str) -> str:
+    text = str(value)
+    replacements = {
+        "daily_sharpe": "sharpe_objective",
+        "total_pnl_cents": "pnl_objective",
+        "percent_to_dollar": "percent_to_dollar_sigma",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+
+def display_table(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in ["selector_objective", "objective"]:
+        if col in out.columns:
+            out[col] = out[col].map(objective_label)
+    for col in ["run_key"]:
+        if col in out.columns:
+            out[col] = out[col].map(clean_label)
+    return out.rename(
+        columns={
+            "selector_objective": "selector",
+            "run_key": "run",
+            "daily_sharpe": "sharpe",
+            "avg_daily_pnl_cents": "avg_pnl_cents",
+            "daily_sortino": "sortino",
+            "daily_sigma_dollars": "rolling_sigma_dollars",
+        }
+    )
+
+
 @st.cache_data(show_spinner=False)
 def load_outputs() -> dict[str, pd.DataFrame]:
     files = {
@@ -349,7 +390,7 @@ def render_walk_forward_tab(data: dict[str, pd.DataFrame]) -> None:
             "profit_factor",
         ]
     ].sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False)
-    st.dataframe(show_metrics, use_container_width=True, hide_index=True)
+    st.dataframe(display_table(show_metrics), use_container_width=True, hide_index=True)
 
     if not daily.empty:
         st.plotly_chart(equity_figure(daily), use_container_width=True)
@@ -359,10 +400,11 @@ def render_walk_forward_tab(data: dict[str, pd.DataFrame]) -> None:
         "Selector objective",
         options=show_metrics["selector_objective"].tolist(),
         index=0,
+        format_func=objective_label,
         key="walk_forward_selector_objective",
     )
     selected_decisions = decisions[decisions["selector_objective"] == selector].copy()
-    st.dataframe(selected_decisions, use_container_width=True, hide_index=True)
+    st.dataframe(display_table(selected_decisions), use_container_width=True, hide_index=True)
 
     if not selected_decisions.empty:
         month_fig = px.bar(
@@ -401,7 +443,7 @@ def render_walk_forward_tab(data: dict[str, pd.DataFrame]) -> None:
             "net_pnl_cents",
             "selected_params",
         ]
-        st.dataframe(selected_trades[display_cols], use_container_width=True, hide_index=True)
+        st.dataframe(display_table(selected_trades[display_cols]), use_container_width=True, hide_index=True)
         st.download_button(
             "Download Trades CSV",
             data=selected_trades.to_csv(index=False).encode("utf-8"),
@@ -433,7 +475,7 @@ def render_walk_forward_tab(data: dict[str, pd.DataFrame]) -> None:
             "selected_params",
             "exclusion_reason",
         ]
-        st.dataframe(selected_out[[c for c in out_cols if c in selected_out.columns]], use_container_width=True, hide_index=True)
+        st.dataframe(display_table(selected_out[[c for c in out_cols if c in selected_out.columns]]), use_container_width=True, hide_index=True)
 
     with st.expander("Parameter Universe"):
         st.markdown("The universe below was defined before the monthly tests. Displayed performance and trades use the Dubai-time window and dynamic bid/ask cost.")
@@ -441,9 +483,9 @@ def render_walk_forward_tab(data: dict[str, pd.DataFrame]) -> None:
 
 
 def render_volatility_tab(vol_data: dict[str, pd.DataFrame], fixed_data: dict[str, pd.DataFrame], vol_method: str) -> None:
-    title = "Dollar Daily Sigma" if vol_method == "dollar" else "Percent Vol Converted To Dollar Sigma"
+    title = "Dollar Sigma" if vol_method == "dollar" else "Percent Vol Converted To Dollar Sigma"
     st.caption(
-        f"{title}: threshold = rolling daily sigma x optimized multiple. "
+        f"{title}: threshold = rolling 63 trading-day sigma x optimized multiple. "
         "The optimizer now uses monthly rebalance only, a 63 trading-day volatility lookback with a 21-day early warm-up, "
         "both signal directions, and a hard Dubai midnight exit."
     )
@@ -474,18 +516,18 @@ def render_volatility_tab(vol_data: dict[str, pd.DataFrame], fixed_data: dict[st
             [
                 {
                     "model": "Fixed cents best",
-                    "run_key": fixed_best["selector_objective"],
+                    "run": objective_label(fixed_best["selector_objective"]),
                     "total_pnl_cents": fixed_best["total_pnl_cents"],
-                    "daily_sharpe": fixed_best["daily_sharpe"],
+                    "sharpe": fixed_best["daily_sharpe"],
                     "max_drawdown_cents": fixed_best["max_drawdown_cents"],
                     "trades": fixed_best["trades"],
                     "profit_factor": fixed_best["profit_factor"],
                 },
                 {
                     "model": title,
-                    "run_key": best["run_key"],
+                    "run": clean_label(best["run_key"]),
                     "total_pnl_cents": best["total_pnl_cents"],
-                    "daily_sharpe": best["daily_sharpe"],
+                    "sharpe": best["daily_sharpe"],
                     "max_drawdown_cents": best["max_drawdown_cents"],
                     "trades": best["trades"],
                     "profit_factor": best["profit_factor"],
@@ -510,17 +552,18 @@ def render_volatility_tab(vol_data: dict[str, pd.DataFrame], fixed_data: dict[st
             "profit_factor",
         ]
     ].sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False)
-    st.dataframe(show_metrics, use_container_width=True, hide_index=True)
+    st.dataframe(display_table(show_metrics), use_container_width=True, hide_index=True)
 
     run_key = st.selectbox(
         "Volatility run",
         options=show_metrics["run_key"].tolist(),
         index=0,
+        format_func=clean_label,
         key=f"vol_run_{vol_method}",
     )
     selected_decisions = decisions[decisions["run_key"] == run_key].copy()
     st.subheader("Rebalance Decisions")
-    st.dataframe(selected_decisions, use_container_width=True, hide_index=True)
+    st.dataframe(display_table(selected_decisions), use_container_width=True, hide_index=True)
 
     if not selected_decisions.empty:
         fig = px.bar(
@@ -529,7 +572,7 @@ def render_volatility_tab(vol_data: dict[str, pd.DataFrame], fixed_data: dict[st
             y="test_total_pnl_cents",
             color="test_total_pnl_cents",
             color_continuous_scale="RdYlGn",
-            title=f"Out-of-Sample PnL By Rebalance Period: {run_key}",
+            title=f"Out-of-Sample PnL By Monthly Rebalance Period: {clean_label(run_key)}",
             labels={"test_start": "Test start", "test_total_pnl_cents": "PnL cents"},
         )
         fig.update_layout(height=360, margin=dict(l=10, r=10, t=45, b=10))
@@ -540,9 +583,9 @@ def render_volatility_tab(vol_data: dict[str, pd.DataFrame], fixed_data: dict[st
         series = daily[[date_col, run_key]].copy()
         series[date_col] = pd.to_datetime(series[date_col])
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=series[date_col], y=series[run_key].fillna(0).cumsum(), mode="lines", name=run_key))
+        fig.add_trace(go.Scatter(x=series[date_col], y=series[run_key].fillna(0).cumsum(), mode="lines", name=clean_label(run_key)))
         fig.update_layout(
-            title=f"Equity Curve: {run_key}",
+            title=f"Equity Curve: {clean_label(run_key)}",
             xaxis_title="Date",
             yaxis_title="Cumulative cents",
             height=390,
@@ -578,18 +621,18 @@ def render_volatility_tab(vol_data: dict[str, pd.DataFrame], fixed_data: dict[st
             "bad_hour_rule",
             "selected_params",
         ]
-        st.dataframe(selected_trades[[c for c in display_cols if c in selected_trades.columns]], use_container_width=True, hide_index=True)
+        st.dataframe(display_table(selected_trades[[c for c in display_cols if c in selected_trades.columns]]), use_container_width=True, hide_index=True)
         st.download_button(
             "Download Volatility Trades CSV",
             data=selected_trades.to_csv(index=False).encode("utf-8"),
-            file_name=f"{run_key}_trades.csv",
+            file_name=f"{clean_label(run_key)}_trades.csv",
             mime="text/csv",
             key=f"vol_trade_download_{vol_method}",
         )
 
     with st.expander("Candidate Universe And Train Rankings"):
-        st.dataframe(universe[universe["vol_method"] == vol_method], use_container_width=True, hide_index=True)
-        st.dataframe(rankings[rankings["run_key"] == run_key], use_container_width=True, hide_index=True)
+        st.dataframe(display_table(universe[universe["vol_method"] == vol_method]), use_container_width=True, hide_index=True)
+        st.dataframe(display_table(rankings[rankings["run_key"] == run_key]), use_container_width=True, hide_index=True)
 
 
 def render_single_backtest_tab() -> None:
@@ -771,6 +814,7 @@ def render_out_of_session_tab(data: dict[str, pd.DataFrame]) -> None:
             "Selector objective",
             selectors,
             index=selectors.index("daily_sharpe") if "daily_sharpe" in selectors else 0,
+            format_func=objective_label,
             key="out_of_session_selector_objective",
         )
         df = wf_excluded[wf_excluded["selector_objective"] == selector].copy()
@@ -857,7 +901,7 @@ def render_out_of_session_tab(data: dict[str, pd.DataFrame]) -> None:
         "exclusion_reason",
     ]
     shown = df[[c for c in display_cols if c in df.columns]].sort_values("signal_time_dubai")
-    st.dataframe(shown, use_container_width=True, hide_index=True)
+    st.dataframe(display_table(shown), use_container_width=True, hide_index=True)
     st.download_button(
         "Download Excluded Trades CSV",
         data=shown.to_csv(index=False).encode("utf-8"),
