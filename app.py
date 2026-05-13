@@ -20,6 +20,7 @@ from price_action_engine import (
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 OUT_DIR = APP_DIR / "outputs" / "clean_walkforward"
+VOL_OUT_DIR = APP_DIR / "outputs" / "volatility_walkforward"
 REPORT_XLSX = OUT_DIR / "walkforward_report.xlsx"
 SINGLE_DEFAULT_TRADES = OUT_DIR / "single_default_trades.csv"
 SINGLE_DEFAULT_EXCLUDED = OUT_DIR / "single_default_out_of_session_trades.csv"
@@ -74,6 +75,24 @@ def load_outputs() -> dict[str, pd.DataFrame]:
     out = {}
     for key, name in files.items():
         path = OUT_DIR / name
+        out[key] = pd.read_csv(path) if path.exists() else pd.DataFrame()
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def load_vol_outputs() -> dict[str, pd.DataFrame]:
+    files = {
+        "metrics": "metrics.csv",
+        "decisions": "decisions.csv",
+        "trades": "trades.csv",
+        "daily": "daily_pnl.csv",
+        "config": "config.csv",
+        "universe": "parameter_universe.csv",
+        "rankings": "train_rankings.csv",
+    }
+    out = {}
+    for key, name in files.items():
+        path = VOL_OUT_DIR / name
         out[key] = pd.read_csv(path) if path.exists() else pd.DataFrame()
     return out
 
@@ -421,6 +440,158 @@ def render_walk_forward_tab(data: dict[str, pd.DataFrame]) -> None:
         st.dataframe(universe, use_container_width=True, hide_index=True)
 
 
+def render_volatility_tab(vol_data: dict[str, pd.DataFrame], fixed_data: dict[str, pd.DataFrame], vol_method: str) -> None:
+    title = "Dollar Daily Sigma" if vol_method == "dollar" else "Percent Vol Converted To Dollar Sigma"
+    st.caption(
+        f"{title}: threshold = rolling daily sigma x optimized multiple. "
+        "The optimizer tests monthly, weekly, and daily rebalance decisions, both signal directions, 21D/42D vol windows, "
+        "and all bad-hour rules."
+    )
+    metrics = vol_data["metrics"]
+    decisions = vol_data["decisions"]
+    trades = vol_data["trades"]
+    daily = vol_data["daily"]
+    universe = vol_data["universe"]
+    rankings = vol_data["rankings"]
+
+    if metrics.empty:
+        st.warning("Volatility walk-forward outputs are missing. Run `python volatility_walkforward_research.py` first.")
+        return
+
+    method_metrics = metrics[metrics["vol_method"] == vol_method].copy()
+    if method_metrics.empty:
+        st.info(f"No results found for {vol_method}.")
+        return
+
+    best = method_metrics.sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False).iloc[0]
+    st.subheader("Best Volatility-Scaled Result")
+    metric_tiles(best)
+
+    fixed_metrics = fixed_data["metrics"]
+    if not fixed_metrics.empty:
+        fixed_best = fixed_metrics.sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False).iloc[0]
+        compare = pd.DataFrame(
+            [
+                {
+                    "model": "Fixed cents best",
+                    "run_key": fixed_best["selector_objective"],
+                    "total_pnl_cents": fixed_best["total_pnl_cents"],
+                    "daily_sharpe": fixed_best["daily_sharpe"],
+                    "max_drawdown_cents": fixed_best["max_drawdown_cents"],
+                    "trades": fixed_best["trades"],
+                    "profit_factor": fixed_best["profit_factor"],
+                },
+                {
+                    "model": title,
+                    "run_key": best["run_key"],
+                    "total_pnl_cents": best["total_pnl_cents"],
+                    "daily_sharpe": best["daily_sharpe"],
+                    "max_drawdown_cents": best["max_drawdown_cents"],
+                    "trades": best["trades"],
+                    "profit_factor": best["profit_factor"],
+                },
+            ]
+        )
+        st.subheader("Comparison Against Fixed-Cent Strategy")
+        st.dataframe(compare, use_container_width=True, hide_index=True)
+
+    st.subheader("All Rebalance Results")
+    show_metrics = method_metrics[
+        [
+            "run_key",
+            "rebalance",
+            "objective",
+            "total_pnl_cents",
+            "daily_sharpe",
+            "max_drawdown_cents",
+            "trades",
+            "trades_per_day",
+            "win_rate",
+            "profit_factor",
+        ]
+    ].sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False)
+    st.dataframe(show_metrics, use_container_width=True, hide_index=True)
+
+    run_key = st.selectbox(
+        "Volatility run",
+        options=show_metrics["run_key"].tolist(),
+        index=0,
+        key=f"vol_run_{vol_method}",
+    )
+    selected_decisions = decisions[decisions["run_key"] == run_key].copy()
+    st.subheader("Rebalance Decisions")
+    st.dataframe(selected_decisions, use_container_width=True, hide_index=True)
+
+    if not selected_decisions.empty:
+        fig = px.bar(
+            selected_decisions,
+            x="test_start",
+            y="test_total_pnl_cents",
+            color="test_total_pnl_cents",
+            color_continuous_scale="RdYlGn",
+            title=f"Out-of-Sample PnL By Rebalance Period: {run_key}",
+            labels={"test_start": "Test start", "test_total_pnl_cents": "PnL cents"},
+        )
+        fig.update_layout(height=360, margin=dict(l=10, r=10, t=45, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+    if not daily.empty and run_key in daily.columns:
+        date_col = daily.columns[0]
+        series = daily[[date_col, run_key]].copy()
+        series[date_col] = pd.to_datetime(series[date_col])
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=series[date_col], y=series[run_key].fillna(0).cumsum(), mode="lines", name=run_key))
+        fig.update_layout(
+            title=f"Equity Curve: {run_key}",
+            xaxis_title="Date",
+            yaxis_title="Cumulative cents",
+            height=390,
+            margin=dict(l=10, r=10, t=45, b=10),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    selected_trades = trades[trades["run_key"] == run_key].copy() if not trades.empty else pd.DataFrame()
+    st.subheader("Trades Taken")
+    if selected_trades.empty:
+        st.info("No trades for this run.")
+    else:
+        display_cols = [
+            "test_start",
+            "test_end",
+            "signal_time",
+            "signal_time_dubai",
+            "entry_time",
+            "entry_time_dubai",
+            "exit_time",
+            "exit_time_dubai",
+            "side",
+            "move_cents",
+            "threshold_cents",
+            "daily_sigma_dollars",
+            "sigma_multiple",
+            "entry_price",
+            "exit_price",
+            "gross_pnl_cents",
+            "cost_cents",
+            "net_pnl_cents",
+            "signal_mode",
+            "bad_hour_rule",
+            "selected_params",
+        ]
+        st.dataframe(selected_trades[[c for c in display_cols if c in selected_trades.columns]], use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download Volatility Trades CSV",
+            data=selected_trades.to_csv(index=False).encode("utf-8"),
+            file_name=f"{run_key}_trades.csv",
+            mime="text/csv",
+            key=f"vol_trade_download_{vol_method}",
+        )
+
+    with st.expander("Candidate Universe And Train Rankings"):
+        st.dataframe(universe[universe["vol_method"] == vol_method], use_container_width=True, hide_index=True)
+        st.dataframe(rankings[rankings["run_key"] == run_key], use_container_width=True, hide_index=True)
+
+
 def render_single_backtest_tab() -> None:
     st.caption(
         "This tab is a diagnostic single-parameter backtest over the full available data period. "
@@ -698,12 +869,23 @@ def render_out_of_session_tab(data: dict[str, pd.DataFrame]) -> None:
 def main() -> None:
     st.title("Price Action Research Dashboard")
     data = load_outputs()
+    vol_data = load_vol_outputs()
 
-    walk_forward_tab, excluded_tab, single_tab = st.tabs(
-        ["Walk-Forward", "Out-Of-Session Analysis", "Single Parameter Backtest"]
+    walk_forward_tab, vol_dollar_tab, vol_percent_tab, excluded_tab, single_tab = st.tabs(
+        [
+            "Fixed-Cent Walk-Forward",
+            "Vol Dollar Sigma",
+            "Vol Percent-to-Dollar",
+            "Out-Of-Session Analysis",
+            "Single Parameter Backtest",
+        ]
     )
     with walk_forward_tab:
         render_walk_forward_tab(data)
+    with vol_dollar_tab:
+        render_volatility_tab(vol_data, data, "dollar")
+    with vol_percent_tab:
+        render_volatility_tab(vol_data, data, "percent_to_dollar")
     with excluded_tab:
         render_out_of_session_tab(data)
     with single_tab:

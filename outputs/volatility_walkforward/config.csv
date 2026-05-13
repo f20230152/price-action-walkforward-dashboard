@@ -1,0 +1,2 @@
+data_start,data_end,raw_files,candidate_count,train_months,rebalance_options,vol_methods,vol_windows_days,bad_hour_rules,session,cost_formula
+2025-10-01 00:00:00,2026-03-26 16:06:23,127,128,3,"monthly,weekly,daily","dollar,percent_to_dollar","21,42","allow_hold,exit_by_midnight,avoid_exit_1_3,avoid_hold_1_3",11:00-24:00 Dubai signal time,round-trip cost cents = abs(entry_price) * 0.04
