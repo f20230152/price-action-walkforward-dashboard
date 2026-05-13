@@ -21,6 +21,8 @@ OUT_DIR = BASE_DIR / "outputs" / "volatility_walkforward"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 TRAIN_MONTHS = 3
+VOL_WINDOWS_DAYS = [63]
+VOL_MIN_OBSERVATIONS = 21
 SESSION_START_HOUR_DUBAI = 11
 SESSION_END_HOUR_DUBAI = 24
 MAX_TRADES_PER_DAY = 1
@@ -64,10 +66,10 @@ def build_universe() -> list[VolParams]:
             [0.40, 0.55],
             [1800],
             [3600, 21600],
-            [21, 42],
+            VOL_WINDOWS_DAYS,
             ["dollar", "percent_to_dollar"],
             ["continuation", "reversal"],
-            ["allow_hold", "exit_by_midnight", "avoid_exit_1_3", "avoid_hold_1_3"],
+            ["exit_by_midnight"],
         )
     ]
 
@@ -78,9 +80,9 @@ def add_volatility_columns(bars: pd.DataFrame) -> pd.DataFrame:
     dollar_change = daily_close.diff()
     pct_change = daily_close.pct_change()
     vol_cols: dict[str, pd.Series] = {}
-    for window in [21, 42]:
-        dollar_sigma = dollar_change.rolling(window, min_periods=max(5, window // 3)).std().shift(1)
-        pct_sigma_to_dollar = (pct_change.rolling(window, min_periods=max(5, window // 3)).std().shift(1) * daily_close.shift(1))
+    for window in VOL_WINDOWS_DAYS:
+        dollar_sigma = dollar_change.rolling(window, min_periods=VOL_MIN_OBSERVATIONS).std().shift(1)
+        pct_sigma_to_dollar = (pct_change.rolling(window, min_periods=VOL_MIN_OBSERVATIONS).std().shift(1) * daily_close.shift(1))
         vol_cols[f"sigma_dollar_{window}"] = dollar_sigma
         vol_cols[f"sigma_percent_to_dollar_{window}"] = pct_sigma_to_dollar
 
@@ -105,10 +107,8 @@ def prepare_days(bars: pd.DataFrame) -> list[dict]:
                     + dubai_index.minute.to_numpy() * 60
                     + dubai_index.second.to_numpy()
                 ),
-                "sigma_dollar_21": _day_scalar(day_bars, "sigma_dollar_21"),
-                "sigma_dollar_42": _day_scalar(day_bars, "sigma_dollar_42"),
-                "sigma_percent_to_dollar_21": _day_scalar(day_bars, "sigma_percent_to_dollar_21"),
-                "sigma_percent_to_dollar_42": _day_scalar(day_bars, "sigma_percent_to_dollar_42"),
+                "sigma_dollar_63": _day_scalar(day_bars, "sigma_dollar_63"),
+                "sigma_percent_to_dollar_63": _day_scalar(day_bars, "sigma_percent_to_dollar_63"),
             }
         )
     return days
@@ -605,7 +605,7 @@ def main() -> None:
         method_params = [p for p in params if p.vol_method == vol_method]
         print("precomputing", vol_method, "candidates", len(method_params), flush=True)
         cache = precompute_results(days, method_params)
-        for rebalance in ["monthly", "weekly", "daily"]:
+        for rebalance in ["monthly"]:
             for objective in ["daily_sharpe", "total_pnl_cents"]:
                 print("running", vol_method, rebalance, objective, "candidates", len(method_params), flush=True)
                 decisions, trades, daily, rankings = run_walkforward_cached(cache, bars, method_params, rebalance, objective)
@@ -640,10 +640,11 @@ def main() -> None:
                 "raw_files": int(len(stats)),
                 "candidate_count": int(len(params)),
                 "train_months": TRAIN_MONTHS,
-                "rebalance_options": "monthly,weekly,daily",
+                "rebalance_options": "monthly",
                 "vol_methods": "dollar,percent_to_dollar",
-                "vol_windows_days": "21,42",
-                "bad_hour_rules": "allow_hold,exit_by_midnight,avoid_exit_1_3,avoid_hold_1_3",
+                "vol_windows_days": "63",
+                "vol_min_observations": VOL_MIN_OBSERVATIONS,
+                "bad_hour_rules": "exit_by_midnight",
                 "session": "11:00-24:00 Dubai signal time",
                 "cost_formula": f"round-trip cost cents = abs(entry_price) * {DYNAMIC_COST_CENTS_PER_PRICE_UNIT:g}",
             }

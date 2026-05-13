@@ -444,8 +444,8 @@ def render_volatility_tab(vol_data: dict[str, pd.DataFrame], fixed_data: dict[st
     title = "Dollar Daily Sigma" if vol_method == "dollar" else "Percent Vol Converted To Dollar Sigma"
     st.caption(
         f"{title}: threshold = rolling daily sigma x optimized multiple. "
-        "The optimizer tests monthly, weekly, and daily rebalance decisions, both signal directions, 21D/42D vol windows, "
-        "and all bad-hour rules."
+        "The optimizer now uses monthly rebalance only, a 63 trading-day volatility lookback with a 21-day early warm-up, "
+        "both signal directions, and a hard Dubai midnight exit."
     )
     metrics = vol_data["metrics"]
     decisions = vol_data["decisions"]

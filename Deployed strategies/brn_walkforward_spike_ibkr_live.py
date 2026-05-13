@@ -1,16 +1,16 @@
 """
 IBKR paper-trading script for the BRN walk-forward spike strategy.
 
-Default deployed parameters come from the volatility-scaled walk-forward run:
-dollar sigma, monthly rebalance, daily_sharpe objective.
+Default deployed parameters come from the latest volatility-scaled walk-forward winner:
+percent-vol converted to dollar sigma, monthly rebalance, daily_sharpe objective.
 
 Strategy:
     - Use 1-second price bars from live market data.
     - Only allow signals from 11:00:00 to 23:59:59 Dubai time.
-    - Compute rolling daily dollar sigma from prior daily closes.
-    - If price moves >= 0.55 x 42D daily dollar sigma over 1800 seconds, trade the configured signal mode.
+    - Compute rolling daily percent volatility from prior daily closes, converted to dollars.
+    - If price moves >= 0.55 x 63D daily dollar-equivalent sigma over 1800 seconds, trade the configured signal mode.
     - Enter 120 seconds after the signal.
-    - Hold for 21600 seconds unless the bad-hour rule blocks the trade.
+    - Hold for 3600 seconds, but always exit by midnight Dubai.
     - Max 1 entry per Dubai calendar day.
     - Quantity: 1 contract.
 
@@ -60,12 +60,13 @@ UTC = timezone.utc
 class StrategyConfig:
     delay_s: int = 120
     sigma_multiple: float = 0.55
-    vol_window_days: int = 42
-    vol_method: str = "dollar"
+    vol_window_days: int = 63
+    vol_min_observations: int = 21
+    vol_method: str = "percent_to_dollar"
     lookback_s: int = 1800
-    hold_s: int = 21600
+    hold_s: int = 3600
     signal_mode: str = "reversal"
-    bad_hour_rule: str = "avoid_hold_1_3"
+    bad_hour_rule: str = "exit_by_midnight"
     max_trades_per_dubai_day: int = 1
     session_start_dubai: time = time(11, 0, 0)
     session_end_dubai: time = time(0, 0, 0)  # Midnight, exclusive.
@@ -266,11 +267,11 @@ class WalkForwardSpikeTrader:
 
         side_label = "BUY" if side > 0 else "SELL"
         entry_time_utc = signal_time_utc + timedelta(seconds=self.strategy.delay_s)
-        scheduled_exit_utc = entry_time_utc + timedelta(seconds=self.strategy.hold_s)
-        if not self.trade_passes_bad_hour_rule(entry_time_utc, scheduled_exit_utc):
+        scheduled_exit_utc = self.planned_exit_time(entry_time_utc)
+        if scheduled_exit_utc is None:
             self.log(
                 "SIGNAL_SKIPPED",
-                f"Signal skipped by bad-hour rule {self.strategy.bad_hour_rule}",
+                "Signal skipped because entry would occur at/after the Dubai midnight hard stop",
                 signal_time_utc=signal_time_utc.isoformat(),
                 signal_time_dubai=signal_time_utc.astimezone(DUBAI_TZ).isoformat(),
                 side=side_label,
@@ -314,7 +315,7 @@ class WalkForwardSpikeTrader:
         bars = self.ib.reqHistoricalData(
             self.contract,
             endDateTime="",
-            durationStr="90 D",
+            durationStr="120 D",
             barSizeSetting="1 day",
             whatToShow="TRADES",
             useRTH=False,
@@ -322,12 +323,20 @@ class WalkForwardSpikeTrader:
             keepUpToDate=False,
         )
         closes = [float(bar.close) for bar in bars if is_valid_price(bar.close)]
-        if len(closes) < self.strategy.vol_window_days + 1:
-            self.log("SIGMA_REFRESH_FAILED", f"Need {self.strategy.vol_window_days + 1} daily closes, got {len(closes)}.")
+        required = min(self.strategy.vol_window_days, self.strategy.vol_min_observations) + 1
+        if len(closes) < required:
+            self.log("SIGMA_REFRESH_FAILED", f"Need at least {required} daily closes, got {len(closes)}.")
             return
-        diffs = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-        window = diffs[-self.strategy.vol_window_days :]
-        self.daily_sigma_dollars = sample_std(window)
+        if self.strategy.vol_method == "dollar":
+            values = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+            window = values[-self.strategy.vol_window_days :] if len(values) >= self.strategy.vol_window_days else values
+            self.daily_sigma_dollars = sample_std(window)
+        elif self.strategy.vol_method == "percent_to_dollar":
+            returns = [(closes[i] / closes[i - 1]) - 1.0 for i in range(1, len(closes)) if closes[i - 1] > 0]
+            window = returns[-self.strategy.vol_window_days :] if len(returns) >= self.strategy.vol_window_days else returns
+            self.daily_sigma_dollars = sample_std(window) * closes[-1]
+        else:
+            raise ValueError(f"Unknown vol method: {self.strategy.vol_method}")
         self.last_sigma_refresh_dubai_day = day
         self.log(
             "SIGMA_REFRESHED",
@@ -336,10 +345,18 @@ class WalkForwardSpikeTrader:
             threshold_cents=self.daily_sigma_dollars * self.strategy.sigma_multiple * 100.0,
         )
 
+    def planned_exit_time(self, entry_utc: datetime) -> datetime | None:
+        hold_exit = entry_utc + timedelta(seconds=self.strategy.hold_s)
+        if self.strategy.bad_hour_rule != "exit_by_midnight":
+            return hold_exit
+        entry_dubai = entry_utc.astimezone(DUBAI_TZ)
+        midnight_dubai = entry_dubai.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        midnight_utc = midnight_dubai.astimezone(UTC)
+        planned = min(hold_exit, midnight_utc)
+        return planned if planned > entry_utc else None
+
     def trade_passes_bad_hour_rule(self, entry_utc: datetime, exit_utc: datetime) -> bool:
         rule = self.strategy.bad_hour_rule
-        if rule == "allow_hold":
-            return True
         entry_dubai = entry_utc.astimezone(DUBAI_TZ)
         exit_dubai = exit_utc.astimezone(DUBAI_TZ)
         if rule == "avoid_exit_1_3":
@@ -347,7 +364,7 @@ class WalkForwardSpikeTrader:
         if rule == "avoid_hold_1_3":
             return not overlaps_bad_window(entry_dubai, exit_dubai)
         if rule == "exit_by_midnight":
-            return True
+            return exit_dubai.date() == entry_dubai.date() or exit_dubai.time() == time(0, 0, 0)
         raise ValueError(f"Unknown bad-hour rule: {rule}")
 
     async def enter_after_delay(self, side: int, signal_time_utc: datetime, scheduled_entry_utc: datetime) -> None:
@@ -380,7 +397,11 @@ class WalkForwardSpikeTrader:
                 side=action,
                 fill_price=entry_price_snapshot,
             )
-            asyncio.create_task(self.exit_after_hold(side=side, dry_run=True))
+            planned_exit = self.planned_exit_time(self.open_entry_time)
+            if planned_exit is None:
+                self.log("EXIT_SCHEDULE_FAILED", "Could not schedule exit before Dubai midnight.")
+                return
+            asyncio.create_task(self.exit_at_time(side=side, dry_run=True, planned_exit_utc=planned_exit))
             return
 
         order = MarketOrder(action, self.ibkr.quantity)
@@ -400,10 +421,14 @@ class WalkForwardSpikeTrader:
             entry_time_utc=self.open_entry_time.isoformat(),
             side=action,
         )
-        asyncio.create_task(self.exit_after_hold(side=side, dry_run=False))
+        planned_exit = self.planned_exit_time(self.open_entry_time)
+        if planned_exit is None:
+            self.log("EXIT_SCHEDULE_FAILED", "Could not schedule exit before Dubai midnight.")
+            return
+        asyncio.create_task(self.exit_at_time(side=side, dry_run=False, planned_exit_utc=planned_exit))
 
-    async def exit_after_hold(self, side: int, dry_run: bool) -> None:
-        await asyncio.sleep(self.strategy.hold_s)
+    async def exit_at_time(self, side: int, dry_run: bool, planned_exit_utc: datetime) -> None:
+        await asyncio.sleep(max(0.0, (planned_exit_utc - datetime.now(UTC)).total_seconds()))
         exit_action = "SELL" if side > 0 else "BUY"
         exit_price_snapshot = self.usable_price()
         entry_price = self.open_entry_price
