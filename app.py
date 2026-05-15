@@ -143,6 +143,7 @@ def load_vol_outputs() -> dict[str, pd.DataFrame]:
         "config": "config.csv",
         "universe": "parameter_universe.csv",
         "rankings": "train_rankings.csv",
+        "multiple_backtests": "multiple_backtests.csv",
     }
     out = {}
     for key, name in files.items():
@@ -499,12 +500,23 @@ def render_volatility_tab(vol_data: dict[str, pd.DataFrame], fixed_data: dict[st
         "The optimizer now uses monthly rebalance only, a 63-session volatility lookback with a 21-session early warm-up, "
         "both signal directions, and a hard Dubai midnight exit."
     )
+    if vol_method == "dollar":
+        st.info(
+            "Dollar Sigma uses the rolling standard deviation of absolute close-to-close dollar moves. "
+            "Example: if the 63-session sigma is $2.00 and the selected multiple is 0.40x, the trigger is an 80 cent move."
+        )
+    else:
+        st.info(
+            "Percent-to-Dollar first measures volatility as percent returns, then converts that volatility back into dollars at the price level. "
+            "This normalizes for price level before calculating the trigger."
+        )
     metrics = vol_data["metrics"]
     decisions = vol_data["decisions"]
     trades = vol_data["trades"]
     daily = vol_data["daily"]
     universe = vol_data["universe"]
     rankings = vol_data["rankings"]
+    multiple_backtests = vol_data["multiple_backtests"]
 
     if metrics.empty:
         st.warning("Volatility walk-forward outputs are missing. Run `python volatility_walkforward_research.py` first.")
@@ -562,6 +574,57 @@ def render_volatility_tab(vol_data: dict[str, pd.DataFrame], fixed_data: dict[st
         ]
     ].sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False)
     st.dataframe(display_table(show_metrics), use_container_width=True, hide_index=True)
+
+    method_multiples = multiple_backtests[multiple_backtests["vol_method"] == vol_method].copy() if not multiple_backtests.empty else pd.DataFrame()
+    if not method_multiples.empty:
+        st.subheader("Sigma Multiple Backtests")
+        st.caption(
+            "These are fixed-parameter full-period diagnostics for each tested sigma multiple. "
+            "They are for checking threshold sensitivity; the selected production-style result still comes from walk-forward only."
+        )
+        best_by_multiple = (
+            method_multiples.sort_values(["sigma_multiple", "daily_sharpe", "total_pnl_cents"], ascending=[True, False, False])
+            .groupby("sigma_multiple", as_index=False)
+            .head(1)
+            .sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False)
+        )
+        multiple_cols = [
+            "sigma_multiple",
+            "signal_mode",
+            "hold_s",
+            "total_pnl_cents",
+            "daily_sharpe",
+            "max_drawdown_cents",
+            "trades",
+            "win_rate",
+            "profit_factor",
+            "params",
+        ]
+        st.dataframe(
+            display_table(best_by_multiple[[c for c in multiple_cols if c in best_by_multiple.columns]]),
+            use_container_width=True,
+            hide_index=True,
+        )
+        with st.expander("All Sigma Multiple Backtests"):
+            all_multiple_cols = [
+                "sigma_multiple",
+                "signal_mode",
+                "hold_s",
+                "backtest_start",
+                "backtest_end",
+                "total_pnl_cents",
+                "daily_sharpe",
+                "max_drawdown_cents",
+                "trades",
+                "win_rate",
+                "profit_factor",
+                "params",
+            ]
+            st.dataframe(
+                display_table(method_multiples[[c for c in all_multiple_cols if c in method_multiples.columns]]),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     run_key = st.selectbox(
         "Volatility run",

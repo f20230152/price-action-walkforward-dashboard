@@ -21,8 +21,10 @@ OUT_DIR = BASE_DIR / "outputs" / "volatility_walkforward"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 TRAIN_MONTHS = 3
+WALKFORWARD_START = pd.Timestamp("2025-11-01")
 VOL_WINDOWS_DAYS = [63]
 VOL_MIN_OBSERVATIONS = 21
+SIGMA_MULTIPLES = [0.25, 0.40, 0.55, 0.75, 1.00]
 SESSION_START_HOUR_DUBAI = 11
 SESSION_END_HOUR_DUBAI = 24
 MAX_TRADES_PER_DAY = 1
@@ -63,7 +65,7 @@ def build_universe() -> list[VolParams]:
         )
         for delay, multiple, lookback, hold, vol_window, vol_method, mode, rule in itertools.product(
             [120],
-            [0.40, 0.55],
+            SIGMA_MULTIPLES,
             [1800],
             [3600, 21600],
             VOL_WINDOWS_DAYS,
@@ -307,16 +309,20 @@ def _trade_summary(pnls: list[float], sides: list[int]) -> dict:
 
 
 def period_schedule(bars: pd.DataFrame, rebalance: str) -> list[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]]:
-    start = pd.Timestamp("2026-01-01")
     end = bars.index.max().normalize()
     if rebalance != "monthly":
         raise ValueError(rebalance)
-    starts = pd.date_range(start, end, freq="MS")
+    starts = pd.date_range(WALKFORWARD_START, end, freq="MS")
     test_ends = [min(s + pd.DateOffset(months=1) - pd.Timedelta(days=1), end) for s in starts]
 
     schedule = []
     for test_start, test_end in zip(starts, test_ends):
-        train_start = test_start - pd.DateOffset(months=TRAIN_MONTHS)
+        if test_start == pd.Timestamp("2025-11-01"):
+            train_start = pd.Timestamp("2025-10-01")
+        elif test_start == pd.Timestamp("2025-12-01"):
+            train_start = pd.Timestamp("2025-10-01")
+        else:
+            train_start = test_start - pd.DateOffset(months=TRAIN_MONTHS)
         train_end = test_start - pd.Timedelta(seconds=1)
         if test_start <= end:
             schedule.append((train_start, train_end, test_start, test_end))
@@ -422,6 +428,37 @@ def select_candidate(grid: pd.DataFrame, objective: str) -> pd.Series | None:
     if objective == "daily_sharpe":
         return eligible.sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False).iloc[0]
     return eligible.sort_values(["total_pnl_cents", "daily_sharpe"], ascending=False).iloc[0]
+
+
+def evaluate_multiple_backtests_cached(
+    cache: dict[VolParams, tuple[pd.Series, pd.DataFrame]],
+    params: list[VolParams],
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame:
+    rows = []
+    for p in params:
+        daily_full, trades_full = cache[p]
+        period_daily = slice_daily(daily_full, start, end)
+        period_trades = slice_trades(trades_full, start, end)
+        metrics = compute_metrics(period_daily, period_trades)
+        rows.append(
+            {
+                "params": p.label,
+                "delay_s": p.delay_s,
+                "sigma_multiple": p.sigma_multiple,
+                "move_window_s": p.move_window_s,
+                "hold_s": p.hold_s,
+                "vol_window_days": p.vol_window_days,
+                "vol_method": p.vol_method,
+                "signal_mode": p.signal_mode,
+                "bad_hour_rule": p.bad_hour_rule,
+                "backtest_start": start.date().isoformat(),
+                "backtest_end": end.date().isoformat(),
+                **metrics,
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False).reset_index(drop=True)
 
 
 def run_walkforward(days: list[dict], bars: pd.DataFrame, params: list[VolParams], rebalance: str, objective: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.DataFrame]:
@@ -600,10 +637,14 @@ def main() -> None:
     all_trades = []
     all_daily = []
     all_rankings = []
+    all_multiple_backtests = []
     for vol_method in ["dollar", "percent_to_dollar"]:
         method_params = [p for p in params if p.vol_method == vol_method]
         print("precomputing", vol_method, "candidates", len(method_params), flush=True)
         cache = precompute_results(days, method_params)
+        multiple_backtests = evaluate_multiple_backtests_cached(cache, method_params, WALKFORWARD_START, bars.index.max().normalize())
+        if not multiple_backtests.empty:
+            all_multiple_backtests.append(multiple_backtests)
         for rebalance in ["monthly"]:
             for objective in ["daily_sharpe", "total_pnl_cents"]:
                 print("running", vol_method, rebalance, objective, "candidates", len(method_params), flush=True)
@@ -631,6 +672,10 @@ def main() -> None:
     (pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()).to_csv(OUT_DIR / "trades.csv", index=False)
     pd.concat(all_daily, axis=1).to_csv(OUT_DIR / "daily_pnl.csv")
     (pd.concat(all_rankings, ignore_index=True) if all_rankings else pd.DataFrame()).to_csv(OUT_DIR / "train_rankings.csv", index=False)
+    (pd.concat(all_multiple_backtests, ignore_index=True) if all_multiple_backtests else pd.DataFrame()).to_csv(
+        OUT_DIR / "multiple_backtests.csv",
+        index=False,
+    )
     pd.DataFrame(
         [
             {
@@ -642,6 +687,9 @@ def main() -> None:
                 "rebalance_options": "monthly",
                 "vol_methods": "dollar,percent_to_dollar",
                 "vol_windows_days": "63",
+                "sigma_multiples": ",".join(f"{x:g}" for x in SIGMA_MULTIPLES),
+                "walkforward_test_start": WALKFORWARD_START.date().isoformat(),
+                "early_rebalance_training": "Nov uses Oct only; Dec uses Oct-Nov; Jan onward uses rolling 3 months",
                 "vol_min_observations": VOL_MIN_OBSERVATIONS,
                 "bad_hour_rules": "exit_by_midnight",
                 "session": "11:00-24:00 Dubai signal time",
