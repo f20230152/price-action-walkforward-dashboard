@@ -461,6 +461,50 @@ def evaluate_multiple_backtests_cached(
     return pd.DataFrame(rows).sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False).reset_index(drop=True)
 
 
+def export_winning_percent_vol_backtest(
+    cache: dict[VolParams, tuple[pd.Series, pd.DataFrame]],
+    multiple_backtests: pd.DataFrame,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> None:
+    if multiple_backtests.empty:
+        return
+    winner = multiple_backtests.sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False).iloc[0]
+    winner_label = str(winner["params"])
+    match = next((p for p in cache if p.label == winner_label), None)
+    if match is None:
+        return
+
+    daily_full, trades_full = cache[match]
+    daily = slice_daily(daily_full, start, end)
+    trades = slice_trades(trades_full, start, end)
+    metrics = compute_metrics(daily, trades)
+
+    metrics_row = {
+        "selected_params": match.label,
+        "backtest_start": start.date().isoformat(),
+        "backtest_end": end.date().isoformat(),
+        "selection_rule": "Best fixed percent-to-dollar candidate by Sharpe, then PnL",
+        "delay_s": match.delay_s,
+        "sigma_multiple": match.sigma_multiple,
+        "move_window_s": match.move_window_s,
+        "hold_s": match.hold_s,
+        "vol_window_days": match.vol_window_days,
+        "vol_method": match.vol_method,
+        "signal_mode": match.signal_mode,
+        "bad_hour_rule": match.bad_hour_rule,
+        **metrics,
+    }
+    pd.DataFrame([metrics_row]).to_csv(OUT_DIR / "winning_percent_vol_backtest_metrics.csv", index=False)
+    daily.rename("daily_pnl_cents").to_csv(OUT_DIR / "winning_percent_vol_backtest_daily.csv")
+    if not trades.empty:
+        trades = trades.copy()
+        trades["selected_params"] = match.label
+        trades["backtest_start"] = start.date().isoformat()
+        trades["backtest_end"] = end.date().isoformat()
+    trades.to_csv(OUT_DIR / "winning_percent_vol_backtest_trades.csv", index=False)
+
+
 def run_walkforward(days: list[dict], bars: pd.DataFrame, params: list[VolParams], rebalance: str, objective: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.DataFrame]:
     decisions = []
     trades_list = []
@@ -645,6 +689,8 @@ def main() -> None:
         multiple_backtests = evaluate_multiple_backtests_cached(cache, method_params, WALKFORWARD_START, bars.index.max().normalize())
         if not multiple_backtests.empty:
             all_multiple_backtests.append(multiple_backtests)
+        if vol_method == "percent_to_dollar":
+            export_winning_percent_vol_backtest(cache, multiple_backtests, WALKFORWARD_START, bars.index.max().normalize())
         for rebalance in ["monthly"]:
             for objective in ["daily_sharpe", "total_pnl_cents"]:
                 print("running", vol_method, rebalance, objective, "candidates", len(method_params), flush=True)

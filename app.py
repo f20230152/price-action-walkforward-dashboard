@@ -144,6 +144,9 @@ def load_vol_outputs() -> dict[str, pd.DataFrame]:
         "universe": "parameter_universe.csv",
         "rankings": "train_rankings.csv",
         "multiple_backtests": "multiple_backtests.csv",
+        "winning_percent_metrics": "winning_percent_vol_backtest_metrics.csv",
+        "winning_percent_daily": "winning_percent_vol_backtest_daily.csv",
+        "winning_percent_trades": "winning_percent_vol_backtest_trades.csv",
     }
     out = {}
     for key, name in files.items():
@@ -707,6 +710,93 @@ def render_volatility_tab(vol_data: dict[str, pd.DataFrame], fixed_data: dict[st
         st.dataframe(display_table(rankings[rankings["run_key"] == run_key]), use_container_width=True, hide_index=True)
 
 
+def render_winning_percent_backtest_tab(vol_data: dict[str, pd.DataFrame]) -> None:
+    st.caption(
+        "Single full-period diagnostic backtest for the best fixed Percent-to-Dollar volatility candidate. "
+        "This is not used to select walk-forward trades."
+    )
+    metrics = vol_data["winning_percent_metrics"]
+    daily = vol_data["winning_percent_daily"]
+    trades = vol_data["winning_percent_trades"]
+
+    if metrics.empty:
+        st.warning("Winning percent-vol backtest output is missing. Run `python volatility_walkforward_research.py` first.")
+        return
+
+    row = metrics.iloc[0]
+    st.subheader("Winning Fixed Percent-Vol Parameters")
+    st.code(str(row["selected_params"]), language="text")
+    metric_tiles(row)
+
+    detail_cols = [
+        "selection_rule",
+        "backtest_start",
+        "backtest_end",
+        "delay_s",
+        "sigma_multiple",
+        "move_window_s",
+        "hold_s",
+        "vol_window_days",
+        "vol_method",
+        "signal_mode",
+        "bad_hour_rule",
+    ]
+    st.dataframe(display_table(metrics[[c for c in detail_cols if c in metrics.columns]]), use_container_width=True, hide_index=True)
+
+    if not daily.empty:
+        date_col = daily.columns[0]
+        pnl_col = "daily_pnl_cents" if "daily_pnl_cents" in daily.columns else daily.columns[-1]
+        curve = daily[[date_col, pnl_col]].copy()
+        curve[date_col] = pd.to_datetime(curve[date_col])
+        curve["equity_cents"] = curve[pnl_col].fillna(0).cumsum()
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=curve[date_col], y=curve["equity_cents"], mode="lines", name="winning percent-vol backtest"))
+        fig.update_layout(
+            title="Equity Curve: Winning Fixed Percent-Vol Backtest",
+            xaxis_title="Date",
+            yaxis_title="Cumulative cents",
+            height=390,
+            margin=dict(l=10, r=10, t=45, b=10),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Trade List")
+    if trades.empty:
+        st.info("No trades in this backtest.")
+        return
+
+    display_cols = [
+        "signal_time",
+        "signal_time_dubai",
+        "entry_time",
+        "entry_time_dubai",
+        "exit_time",
+        "exit_time_dubai",
+        "side",
+        "move_cents",
+        "threshold_cents",
+        "daily_sigma_dollars",
+        "sigma_multiple",
+        "entry_price",
+        "exit_price",
+        "gross_pnl_cents",
+        "cost_cents",
+        "net_pnl_cents",
+        "signal_mode",
+        "bad_hour_rule",
+        "selected_params",
+    ]
+    shown = trades[[c for c in display_cols if c in trades.columns]].copy()
+    st.dataframe(display_table(shown), use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download Winning Percent-Vol Trades CSV",
+        data=trades.to_csv(index=False).encode("utf-8"),
+        file_name="winning_percent_vol_backtest_trades.csv",
+        mime="text/csv",
+        key="winning_percent_vol_trade_download",
+    )
+
+
 def render_single_backtest_tab() -> None:
     st.caption(
         "This tab is a diagnostic single-parameter backtest over the full available data period. "
@@ -987,11 +1077,12 @@ def main() -> None:
     data = load_outputs()
     vol_data = load_vol_outputs()
 
-    walk_forward_tab, vol_dollar_tab, vol_percent_tab, excluded_tab, single_tab = st.tabs(
+    walk_forward_tab, vol_dollar_tab, vol_percent_tab, winning_percent_tab, excluded_tab, single_tab = st.tabs(
         [
             "Fixed-Cent Walk-Forward",
             "Vol Dollar Sigma",
             "Vol Percent-to-Dollar",
+            "Winning Percent Vol Backtest",
             "Out-Of-Session Analysis",
             "Single Parameter Backtest",
         ]
@@ -1002,6 +1093,8 @@ def main() -> None:
         render_volatility_tab(vol_data, data, "dollar")
     with vol_percent_tab:
         render_volatility_tab(vol_data, data, "percent_to_dollar")
+    with winning_percent_tab:
+        render_winning_percent_backtest_tab(vol_data)
     with excluded_tab:
         render_out_of_session_tab(data)
     with single_tab:
