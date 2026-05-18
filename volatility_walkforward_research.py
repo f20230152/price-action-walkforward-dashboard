@@ -30,6 +30,10 @@ STABLE_DELAYS = [60, 120, 300]
 STABLE_SIGMA_MULTIPLES = [0.25, 0.40, 0.55, 0.75, 1.00]
 STABLE_MOVE_WINDOWS = [900, 1800, 3600]
 STABLE_HOLDS = [3600, 7200, 14400, 21600]
+ANTI_DELAYS = [60, 90, 120, 180, 300]
+ANTI_SIGMA_MULTIPLES = [round(x, 2) for x in np.arange(0.25, 1.051, 0.05)]
+ANTI_MOVE_WINDOWS = [900, 1200, 1800, 2400, 3600]
+ANTI_HOLDS = [1800, 3600, 7200, 14400, 21600]
 RARE_DELAYS = [60, 120, 300]
 RARE_PERCENTILES = [95.0, 97.5, 99.0]
 RARE_MOVE_WINDOWS = [300, 900, 1800, 3600]
@@ -199,6 +203,29 @@ def build_stable_universe() -> list[VolParams]:
             STABLE_SIGMA_MULTIPLES,
             STABLE_MOVE_WINDOWS,
             STABLE_HOLDS,
+            VOL_WINDOWS_DAYS,
+            ["continuation", "reversal"],
+        )
+    ]
+
+
+def build_anti_overfit_universe() -> list[VolParams]:
+    return [
+        VolParams(
+            delay_s=delay,
+            sigma_multiple=multiple,
+            move_window_s=lookback,
+            hold_s=hold,
+            vol_window_days=vol_window,
+            vol_method="percent_to_dollar",
+            signal_mode=mode,
+            bad_hour_rule="exit_by_midnight",
+        )
+        for delay, multiple, lookback, hold, vol_window, mode in itertools.product(
+            ANTI_DELAYS,
+            ANTI_SIGMA_MULTIPLES,
+            ANTI_MOVE_WINDOWS,
+            ANTI_HOLDS,
             VOL_WINDOWS_DAYS,
             ["continuation", "reversal"],
         )
@@ -587,7 +614,9 @@ def apply_bad_hour_rule(times: np.ndarray, dubai_times: pd.DatetimeIndex, entry_
         midnight_dubai = pd.Timestamp(entry_dubai.date()) + pd.Timedelta(days=1)
         midnight_utc = midnight_dubai - pd.Timedelta(hours=DUBAI_UTC_OFFSET_HOURS)
         forced = int(np.searchsorted(times, np.datetime64(midnight_utc.to_datetime64()), side="left") - 1)
-        return forced if forced > entry_idx else None
+        if forced <= entry_idx:
+            return None
+        return min(exit_idx, forced)
 
     if rule == "avoid_exit_1_3":
         return None if 1 <= exit_dubai.hour < 3 else exit_idx
@@ -827,6 +856,38 @@ def concentration_metrics(daily: pd.Series, trades: pd.DataFrame) -> dict:
     }
 
 
+def top_trade_neutral_metrics(daily: pd.Series, trades: pd.DataFrame) -> dict:
+    deflated_daily = daily.copy()
+    deflated_trades = trades.copy() if trades is not None else pd.DataFrame()
+    removed_top_win = 0.0
+
+    if (
+        trades is not None
+        and not trades.empty
+        and "net_pnl_cents" in trades.columns
+        and "signal_time" in trades.columns
+    ):
+        positive = trades[trades["net_pnl_cents"].astype(float) > 0]
+        if not positive.empty:
+            top_idx = positive["net_pnl_cents"].astype(float).idxmax()
+            removed_top_win = float(trades.loc[top_idx, "net_pnl_cents"])
+            trade_date = pd.to_datetime(trades.loc[top_idx, "signal_time"]).normalize()
+            if trade_date in deflated_daily.index:
+                deflated_daily.loc[trade_date] = float(deflated_daily.loc[trade_date]) - removed_top_win
+            deflated_trades = trades.drop(index=top_idx)
+
+    metrics = compute_metrics(deflated_daily, deflated_trades)
+    return {
+        "removed_top_win_cents": removed_top_win,
+        "deflated_total_pnl_cents": metrics["total_pnl_cents"],
+        "deflated_daily_sharpe": metrics["daily_sharpe"],
+        "deflated_max_drawdown_cents": metrics["max_drawdown_cents"],
+        "deflated_trades": metrics["trades"],
+        "deflated_win_rate": metrics["win_rate"],
+        "deflated_profit_factor": metrics["profit_factor"],
+    }
+
+
 def robust_score(metrics: dict, concentration: dict) -> float:
     if (
         metrics["trades"] < MIN_TRAIN_TRADES
@@ -842,6 +903,29 @@ def robust_score(metrics: dict, concentration: dict) -> float:
         + 0.75 * concentration["profitable_month_rate"]
         - 0.50 * max(concentration["top_trade_share"] - 0.35, 0.0)
         - 0.50 * max(concentration["best_month_share"] - 0.60, 0.0)
+        + 0.001 * metrics["max_drawdown_cents"]
+    )
+
+
+def anti_overfit_score(metrics: dict, concentration: dict, deflated: dict) -> float:
+    if (
+        metrics["trades"] < MIN_TRAIN_TRADES
+        or metrics["total_pnl_cents"] <= 0
+        or metrics["daily_sharpe"] <= 0
+        or deflated["deflated_total_pnl_cents"] <= 0
+        or deflated["deflated_daily_sharpe"] <= 0
+        or concentration["profitable_month_rate"] < 0.50
+        or concentration["top_trade_share"] > 0.55
+        or concentration["best_month_share"] > 0.70
+    ):
+        return -np.inf
+
+    return float(
+        deflated["deflated_daily_sharpe"]
+        + 0.002 * deflated["deflated_total_pnl_cents"]
+        + 0.75 * concentration["profitable_month_rate"]
+        - 0.75 * max(concentration["top_trade_share"] - 0.35, 0.0)
+        - 0.75 * max(concentration["best_month_share"] - 0.55, 0.0)
         + 0.001 * metrics["max_drawdown_cents"]
     )
 
@@ -934,6 +1018,87 @@ def evaluate_stable_grid_cached(
     end: pd.Timestamp,
 ) -> pd.DataFrame:
     return add_stable_cluster_scores(evaluate_robust_grid_cached(cache, params, start, end))
+
+
+def add_anti_cluster_scores(grid: pd.DataFrame) -> pd.DataFrame:
+    if grid.empty:
+        return grid
+    out = grid.copy()
+    positive = (
+        (out["total_pnl_cents"] > 0)
+        & (out["daily_sharpe"] > 0)
+        & (out["deflated_total_pnl_cents"] > 0)
+        & (out["deflated_daily_sharpe"] > 0)
+    )
+    delay_idx = out["delay_s"].map(lambda x: _index_distance(int(x), ANTI_DELAYS))
+    sigma_idx = out["sigma_multiple"].map(lambda x: _index_distance(float(x), ANTI_SIGMA_MULTIPLES))
+    lookback_idx = out["move_window_s"].map(lambda x: _index_distance(int(x), ANTI_MOVE_WINDOWS))
+    hold_idx = out["hold_s"].map(lambda x: _index_distance(int(x), ANTI_HOLDS))
+
+    cluster_counts = []
+    cluster_positive_counts = []
+    for idx, row in out.iterrows():
+        same_family = out["signal_mode"].eq(row["signal_mode"])
+        nearby = (
+            same_family
+            & ((delay_idx - delay_idx.loc[idx]).abs() <= 1)
+            & ((sigma_idx - sigma_idx.loc[idx]).abs() <= 1)
+            & ((lookback_idx - lookback_idx.loc[idx]).abs() <= 1)
+            & ((hold_idx - hold_idx.loc[idx]).abs() <= 1)
+        )
+        nearby.loc[idx] = False
+        cluster_count = int(nearby.sum())
+        cluster_positive_count = int((nearby & positive).sum())
+        cluster_counts.append(cluster_count)
+        cluster_positive_counts.append(cluster_positive_count)
+
+    out["cluster_neighbors"] = cluster_counts
+    out["cluster_positive_neighbors"] = cluster_positive_counts
+    out["cluster_positive_rate"] = np.where(
+        out["cluster_neighbors"] > 0,
+        out["cluster_positive_neighbors"] / out["cluster_neighbors"],
+        0.0,
+    )
+    out["anti_overfit_score"] = out["score"] + 0.35 * out["cluster_positive_neighbors"] + 1.25 * out["cluster_positive_rate"]
+    return out.sort_values(
+        ["anti_overfit_score", "cluster_positive_neighbors", "deflated_daily_sharpe", "deflated_total_pnl_cents"],
+        ascending=False,
+    ).reset_index(drop=True)
+
+
+def evaluate_anti_overfit_grid_cached(
+    cache: dict[VolParams, tuple[pd.Series, pd.DataFrame]],
+    params: list[VolParams],
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame:
+    rows = []
+    for p in params:
+        daily, trades = cache[p]
+        period_daily = slice_daily(daily, start, end)
+        period_trades = slice_trades(trades, start, end)
+        metrics = compute_metrics(period_daily, period_trades)
+        concentration = concentration_metrics(period_daily, period_trades)
+        deflated = top_trade_neutral_metrics(period_daily, period_trades)
+        rows.append(
+            {
+                "params_obj": p,
+                "params": p.label,
+                "delay_s": p.delay_s,
+                "sigma_multiple": p.sigma_multiple,
+                "move_window_s": p.move_window_s,
+                "hold_s": p.hold_s,
+                "vol_window_days": p.vol_window_days,
+                "vol_method": p.vol_method,
+                "signal_mode": p.signal_mode,
+                "bad_hour_rule": p.bad_hour_rule,
+                "score": anti_overfit_score(metrics, concentration, deflated),
+                **metrics,
+                **concentration,
+                **deflated,
+            }
+        )
+    return add_anti_cluster_scores(pd.DataFrame(rows))
 
 
 def evaluate_rare_grid_cached(
@@ -1059,6 +1224,30 @@ def select_stable_candidate(grid: pd.DataFrame) -> pd.Series | None:
         return None
     return eligible.sort_values(
         ["stable_score", "cluster_positive_neighbors", "top_trade_removed_pnl_cents", "daily_sharpe"],
+        ascending=False,
+    ).iloc[0]
+
+
+def select_anti_overfit_candidate(grid: pd.DataFrame) -> pd.Series | None:
+    if grid.empty:
+        return None
+    eligible = grid[
+        np.isfinite(grid["anti_overfit_score"])
+        & (grid["month_count"] >= 2)
+        & (grid["trades"] >= MIN_TRAIN_TRADES)
+        & (grid["total_pnl_cents"] > 0)
+        & (grid["daily_sharpe"] > 0)
+        & (grid["deflated_total_pnl_cents"] > 0)
+        & (grid["deflated_daily_sharpe"] > 0)
+        & (grid["profitable_month_rate"] >= 0.50)
+        & (grid["top_trade_share"] <= 0.55)
+        & (grid["best_month_share"] <= 0.70)
+        & (grid["cluster_positive_neighbors"] >= 2)
+    ].copy()
+    if eligible.empty:
+        return None
+    return eligible.sort_values(
+        ["anti_overfit_score", "cluster_positive_neighbors", "deflated_total_pnl_cents", "deflated_daily_sharpe"],
         ascending=False,
     ).iloc[0]
 
@@ -1519,6 +1708,115 @@ def run_stable_walkforward_cached(
     return decisions_df, trades_df, daily_oos, rankings_df
 
 
+def run_anti_overfit_walkforward_cached(
+    cache: dict[VolParams, tuple[pd.Series, pd.DataFrame]],
+    bars: pd.DataFrame,
+    params: list[VolParams],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.DataFrame]:
+    run_key = "anti_overfit_percent_wf"
+    run_label = "Anti-overfit top-trade-neutral walk-forward"
+    objective = "top_trade_neutral_score"
+    decisions = []
+    trades_list = []
+    daily_list = []
+    rankings = []
+
+    for train_start, train_end, test_start, test_end in period_schedule(bars, "monthly"):
+        grid = evaluate_anti_overfit_grid_cached(cache, params, train_start, train_end)
+        selected = select_anti_overfit_candidate(grid)
+        top = grid.drop(columns=["params_obj"]).head(75).copy()
+        top["run_key"] = run_key
+        top["run_label"] = run_label
+        top["objective"] = objective
+        top["train_start"] = train_start.date().isoformat()
+        top["train_end"] = train_end.date().isoformat()
+        top["test_start"] = test_start.date().isoformat()
+        top["test_end"] = test_end.date().isoformat()
+        rankings.append(top)
+
+        if selected is None:
+            decisions.append(
+                {
+                    "run_key": run_key,
+                    "run_label": run_label,
+                    "objective": objective,
+                    "train_start": train_start.date().isoformat(),
+                    "train_end": train_end.date().isoformat(),
+                    "test_start": test_start.date().isoformat(),
+                    "test_end": test_end.date().isoformat(),
+                    "selected_params": "NO_TOP_TRADE_NEUTRAL_CANDIDATE",
+                    "test_total_pnl_cents": 0.0,
+                    "test_sharpe": 0.0,
+                    "test_trades": 0,
+                    "test_deflated_total_pnl_cents": 0.0,
+                    "test_deflated_sharpe": 0.0,
+                    "test_removed_top_win_cents": 0.0,
+                }
+            )
+            continue
+
+        p: VolParams = selected["params_obj"]
+        daily_full, trades_full = cache[p]
+        daily = slice_daily(daily_full, test_start, test_end)
+        trades = slice_trades(trades_full, test_start, test_end)
+        metrics = compute_metrics(daily, trades)
+        concentration = concentration_metrics(daily, trades)
+        deflated = top_trade_neutral_metrics(daily, trades)
+        daily_list.append(daily)
+        if not trades.empty:
+            out_trades = trades.copy()
+            out_trades["run_key"] = run_key
+            out_trades["run_label"] = run_label
+            out_trades["objective"] = objective
+            out_trades["test_start"] = test_start.date().isoformat()
+            out_trades["test_end"] = test_end.date().isoformat()
+            out_trades["selected_params"] = p.label
+            trades_list.append(out_trades)
+
+        decisions.append(
+            {
+                "run_key": run_key,
+                "run_label": run_label,
+                "objective": objective,
+                "train_start": train_start.date().isoformat(),
+                "train_end": train_end.date().isoformat(),
+                "test_start": test_start.date().isoformat(),
+                "test_end": test_end.date().isoformat(),
+                "selected_params": p.label,
+                "train_anti_overfit_score": float(selected["anti_overfit_score"]),
+                "train_total_pnl_cents": float(selected["total_pnl_cents"]),
+                "train_sharpe": float(selected["daily_sharpe"]),
+                "train_trades": int(selected["trades"]),
+                "train_deflated_total_pnl_cents": float(selected["deflated_total_pnl_cents"]),
+                "train_deflated_sharpe": float(selected["deflated_daily_sharpe"]),
+                "train_removed_top_win_cents": float(selected["removed_top_win_cents"]),
+                "train_profitable_month_rate": float(selected["profitable_month_rate"]),
+                "train_top_trade_share": float(selected["top_trade_share"]),
+                "train_best_month_share": float(selected["best_month_share"]),
+                "train_cluster_positive_neighbors": int(selected["cluster_positive_neighbors"]),
+                "train_cluster_positive_rate": float(selected["cluster_positive_rate"]),
+                "test_total_pnl_cents": metrics["total_pnl_cents"],
+                "test_sharpe": metrics["daily_sharpe"],
+                "test_trades": metrics["trades"],
+                "test_win_rate": metrics["win_rate"],
+                "test_max_drawdown_cents": metrics["max_drawdown_cents"],
+                "test_profitable_month_rate": concentration["profitable_month_rate"],
+                "test_top_trade_share": concentration["top_trade_share"],
+                "test_best_month_share": concentration["best_month_share"],
+                "test_top_trade_removed_pnl_cents": concentration["top_trade_removed_pnl_cents"],
+                "test_deflated_total_pnl_cents": deflated["deflated_total_pnl_cents"],
+                "test_deflated_sharpe": deflated["deflated_daily_sharpe"],
+                "test_removed_top_win_cents": deflated["removed_top_win_cents"],
+            }
+        )
+
+    daily_oos = pd.concat(daily_list).sort_index().groupby(level=0).sum() if daily_list else pd.Series(dtype=float, name="daily_pnl_cents")
+    trades_df = pd.concat(trades_list, ignore_index=True) if trades_list else pd.DataFrame()
+    decisions_df = pd.DataFrame(decisions)
+    rankings_df = pd.concat(rankings, ignore_index=True) if rankings else pd.DataFrame()
+    return decisions_df, trades_df, daily_oos, rankings_df
+
+
 def run_rare_walkforward_cached(
     cache: dict[RareMoveParams, tuple[pd.Series, pd.DataFrame]],
     bars: pd.DataFrame,
@@ -1907,6 +2205,34 @@ def main() -> None:
     if not top_trades.empty:
         all_top_trades.append(top_trades)
 
+    anti_params = build_anti_overfit_universe()
+    pd.DataFrame([p.__dict__ | {"label": p.label} for p in anti_params]).to_csv(OUT_DIR / "anti_overfit_parameter_universe.csv", index=False)
+    print("precomputing anti-overfit top-trade-neutral candidates", len(anti_params), flush=True)
+    anti_cache = precompute_results(days, anti_params)
+    anti_decisions, anti_trades, anti_daily, anti_rankings = run_anti_overfit_walkforward_cached(anti_cache, bars, anti_params)
+    anti_metrics = compute_metrics(anti_daily, anti_trades)
+    anti_concentration = concentration_metrics(anti_daily, anti_trades)
+    anti_deflated = top_trade_neutral_metrics(anti_daily, anti_trades)
+    anti_run_key = "anti_overfit_percent_wf"
+    anti_run_label = "Anti-overfit top-trade-neutral walk-forward"
+    anti_metrics_df = pd.DataFrame(
+        [
+            {
+                "run_key": anti_run_key,
+                "run_label": anti_run_label,
+                "objective": "top_trade_neutral_score",
+                **anti_metrics,
+                **anti_concentration,
+                **anti_deflated,
+            }
+        ]
+    )
+    all_monthly_audit.extend(monthly_audit_rows(anti_daily, anti_trades, anti_run_key, anti_run_label))
+    all_repeated_clocks.extend(repeated_clock_rows(anti_trades, anti_run_key, anti_run_label))
+    top_trades = top_trade_rows(anti_trades, anti_run_key, anti_run_label)
+    if not top_trades.empty:
+        all_top_trades.append(top_trades)
+
     rare_params = build_rare_universe()
     pd.DataFrame([p.__dict__ | {"label": p.label} for p in rare_params]).to_csv(OUT_DIR / "rare_move_parameter_universe.csv", index=False)
     print("precomputing rare move candidates", len(rare_params), flush=True)
@@ -1982,6 +2308,11 @@ def main() -> None:
     stable_trades.to_csv(OUT_DIR / "stable_4var_trades.csv", index=False)
     stable_daily.rename(stable_run_key).to_csv(OUT_DIR / "stable_4var_daily_pnl.csv")
     stable_rankings.to_csv(OUT_DIR / "stable_4var_train_rankings.csv", index=False)
+    anti_metrics_df.to_csv(OUT_DIR / "anti_overfit_metrics.csv", index=False)
+    anti_decisions.to_csv(OUT_DIR / "anti_overfit_decisions.csv", index=False)
+    anti_trades.to_csv(OUT_DIR / "anti_overfit_trades.csv", index=False)
+    anti_daily.rename(anti_run_key).to_csv(OUT_DIR / "anti_overfit_daily_pnl.csv")
+    anti_rankings.to_csv(OUT_DIR / "anti_overfit_train_rankings.csv", index=False)
     rare_metrics_df.to_csv(OUT_DIR / "rare_move_metrics.csv", index=False)
     rare_decisions.to_csv(OUT_DIR / "rare_move_decisions.csv", index=False)
     rare_trades.to_csv(OUT_DIR / "rare_move_trades.csv", index=False)
@@ -2003,6 +2334,7 @@ def main() -> None:
                 "raw_files": int(len(stats)),
                 "candidate_count": int(len(params)),
                 "stable_4var_candidate_count": int(len(stable_params)),
+                "anti_overfit_candidate_count": int(len(anti_params)),
                 "rare_move_candidate_count": int(len(rare_params)),
                 "regime_rare_move_candidate_count": int(len(regime_rare_params)),
                 "train_months": TRAIN_MONTHS,
@@ -2014,6 +2346,10 @@ def main() -> None:
                 "stable_4var_b_sigma_multiples": ",".join(f"{x:g}" for x in STABLE_SIGMA_MULTIPLES),
                 "stable_4var_c_move_windows_seconds": ",".join(str(x) for x in STABLE_MOVE_WINDOWS),
                 "stable_4var_d_hold_seconds": ",".join(str(x) for x in STABLE_HOLDS),
+                "anti_overfit_a_delay_seconds": ",".join(str(x) for x in ANTI_DELAYS),
+                "anti_overfit_b_sigma_multiples": ",".join(f"{x:g}" for x in ANTI_SIGMA_MULTIPLES),
+                "anti_overfit_c_move_windows_seconds": ",".join(str(x) for x in ANTI_MOVE_WINDOWS),
+                "anti_overfit_d_hold_seconds": ",".join(str(x) for x in ANTI_HOLDS),
                 "rare_move_a_delay_seconds": ",".join(str(x) for x in RARE_DELAYS),
                 "rare_move_b_percentiles": ",".join(f"{x:g}" for x in RARE_PERCENTILES),
                 "rare_move_c_move_windows_seconds": ",".join(str(x) for x in RARE_MOVE_WINDOWS),
@@ -2028,6 +2364,7 @@ def main() -> None:
                 "vol_min_observations": VOL_MIN_OBSERVATIONS,
                 "full_signal_window_in_session": REQUIRE_FULL_SIGNAL_WINDOW_IN_SESSION,
                 "robust_objective": "Sharpe plus top-trade-removed PnL and profitable-month rate, penalized for top-trade and best-month concentration",
+                "anti_overfit_objective": "Select monthly parameters only if training remains profitable and Sharpe-positive after subtracting the largest winning training trade",
                 "bad_hour_rules": "exit_by_midnight",
                 "session": "11:00-24:00 Dubai signal time",
                 "cost_formula": f"round-trip cost cents = abs(entry_price) * {DYNAMIC_COST_CENTS_PER_PRICE_UNIT:g}",

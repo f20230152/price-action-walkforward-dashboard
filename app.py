@@ -161,6 +161,12 @@ def load_vol_outputs() -> dict[str, pd.DataFrame]:
         "stable_4var_daily": "stable_4var_daily_pnl.csv",
         "stable_4var_rankings": "stable_4var_train_rankings.csv",
         "stable_4var_universe": "stable_parameter_universe.csv",
+        "anti_overfit_metrics": "anti_overfit_metrics.csv",
+        "anti_overfit_decisions": "anti_overfit_decisions.csv",
+        "anti_overfit_trades": "anti_overfit_trades.csv",
+        "anti_overfit_daily": "anti_overfit_daily_pnl.csv",
+        "anti_overfit_rankings": "anti_overfit_train_rankings.csv",
+        "anti_overfit_universe": "anti_overfit_parameter_universe.csv",
         "rare_move_metrics": "rare_move_metrics.csv",
         "rare_move_decisions": "rare_move_decisions.csv",
         "rare_move_trades": "rare_move_trades.csv",
@@ -177,7 +183,13 @@ def load_vol_outputs() -> dict[str, pd.DataFrame]:
     out = {}
     for key, name in files.items():
         path = VOL_OUT_DIR / name
-        out[key] = pd.read_csv(path) if path.exists() else pd.DataFrame()
+        if not path.exists():
+            out[key] = pd.DataFrame()
+            continue
+        try:
+            out[key] = pd.read_csv(path)
+        except pd.errors.EmptyDataError:
+            out[key] = pd.DataFrame()
     return out
 
 
@@ -987,6 +999,195 @@ def render_stable_4var_tab(vol_data: dict[str, pd.DataFrame]) -> None:
         st.dataframe(display_table(rankings), use_container_width=True, hide_index=True)
 
 
+def render_anti_overfit_tab(vol_data: dict[str, pd.DataFrame]) -> None:
+    st.caption(
+        "Purpose: repeat the 4-variable walk-forward, but stop one exceptional March-style winning trade from deciding the parameters."
+    )
+    st.info(
+        "Simple: for every parameter set in the training window, the dashboard first finds the biggest winning trade and subtracts it. "
+        "A parameter is allowed to trade next month only if it still has positive PnL and positive Sharpe after that subtraction. "
+        "Technical: this is still a true monthly walk-forward; the top-trade removal is used only inside the training objective and diagnostics, "
+        "while the OOS result keeps the real trades and also reports a deflated OOS result after removing its biggest OOS winner."
+    )
+
+    metrics = vol_data["anti_overfit_metrics"]
+    decisions = vol_data["anti_overfit_decisions"]
+    trades = vol_data["anti_overfit_trades"]
+    daily = vol_data["anti_overfit_daily"]
+    rankings = vol_data["anti_overfit_rankings"]
+    universe = vol_data["anti_overfit_universe"]
+
+    if metrics.empty:
+        st.warning("Anti-overfit outputs are missing. Run `python volatility_walkforward_research.py` first.")
+        return
+
+    st.subheader("Exactly What This Test Changes")
+    explanation_rows = pd.DataFrame(
+        [
+            {
+                "item": "What data is used?",
+                "beginner_explanation": "All data is still used. We are not deleting March or any large move from the backtest.",
+                "technical_explanation": "The raw OOS equity and trade list are untouched. Deflation is an auxiliary robustness calculation.",
+            },
+            {
+                "item": "What is removed?",
+                "beginner_explanation": "Only the single biggest winning trade is removed while judging whether a training parameter is stable.",
+                "technical_explanation": "For each candidate and each training window: deflated_daily_pnl = daily_pnl minus max positive trade PnL on that trade's date.",
+            },
+            {
+                "item": "Why do this?",
+                "beginner_explanation": "If a strategy only looks good because of one lucky trade, it should not be trusted for next month.",
+                "technical_explanation": "This reduces single-trade selection bias and tests whether performance survives a simple top-winner stress test.",
+            },
+            {
+                "item": "What is selected?",
+                "beginner_explanation": "The next month's parameter must make money, have positive Sharpe, survive top-trade removal, and have nearby parameters also working.",
+                "technical_explanation": "Eligibility requires positive raw PnL/Sharpe, positive deflated PnL/Sharpe, >=5 train trades, >=50% profitable train months, concentration caps, and cluster support.",
+            },
+        ]
+    )
+    st.dataframe(explanation_rows, use_container_width=True, hide_index=True)
+
+    st.subheader("Finer 4-Variable Search Space")
+    variable_rows = pd.DataFrame(
+        [
+            {
+                "variable": "a = entry delay",
+                "beginner_explanation": "How long to wait after the spike before entering.",
+                "technical_explanation": "Tested values: 60, 90, 120, 180, 300 seconds.",
+            },
+            {
+                "variable": "b = volatility multiple",
+                "beginner_explanation": "How big the move must be relative to recent normal daily movement.",
+                "technical_explanation": "Threshold = b x rolling 63-session percent-return sigma converted into dollars, tested from 0.25x to 1.05x in 0.05 steps.",
+            },
+            {
+                "variable": "c = move window",
+                "beginner_explanation": "How many seconds of price action are checked to decide whether a spike happened.",
+                "technical_explanation": "Signal move = price_now - price_c_seconds_ago. Tested values: 900, 1200, 1800, 2400, 3600 seconds.",
+            },
+            {
+                "variable": "d = holding time",
+                "beginner_explanation": "How long to hold after entry, with a hard exit at midnight Dubai.",
+                "technical_explanation": "Exit = min(entry + d, 24:00 Dubai session hard stop). Tested values: 1800, 3600, 7200, 14400, 21600 seconds.",
+            },
+        ]
+    )
+    st.dataframe(variable_rows, use_container_width=True, hide_index=True)
+
+    row = metrics.iloc[0]
+    st.subheader("Anti-Overfit Walk-Forward Result")
+    metric_tiles(row)
+    stress_cols = [
+        "run_label",
+        "total_pnl_cents",
+        "daily_sharpe",
+        "trades",
+        "max_drawdown_cents",
+        "removed_top_win_cents",
+        "deflated_total_pnl_cents",
+        "deflated_daily_sharpe",
+        "top_trade_share",
+        "best_month_share",
+        "profitable_month_rate",
+    ]
+    st.dataframe(display_table(metrics[[c for c in stress_cols if c in metrics.columns]]), use_container_width=True, hide_index=True)
+    st.caption(
+        "Raw PnL/Sharpe is the actual OOS walk-forward result. Deflated PnL/Sharpe answers: after the full OOS run is complete, "
+        "would the result still look good if the single biggest winning OOS trade had not happened?"
+    )
+    if float(row.get("deflated_total_pnl_cents", 0.0)) <= 0:
+        st.error(
+            "Conclusion: this version is not robust if the deflated OOS PnL is negative. "
+            "Simple: the strategy still depends too much on one large winner. "
+            "Technical: the monthly selector may pass the training top-trade stress test, but the combined unseen OOS distribution remains top-trade concentrated."
+        )
+    elif float(row.get("total_pnl_cents", 0.0)) > 0 and float(row.get("deflated_total_pnl_cents", 0.0)) > 0:
+        st.success(
+            "Conclusion: this is stronger than a plain best-PnL backtest because both raw OOS and top-trade-neutral OOS are positive. "
+            "It still needs more months before being considered production-grade."
+        )
+
+    st.subheader("Monthly Rebalance Decisions")
+    st.caption(
+        "Each row is one walk-forward decision. The train columns are known before the month starts. The test columns are the unseen next-month result. "
+        "`train_deflated_total_pnl_cents` and `train_deflated_sharpe` are the key anti-overfit checks."
+    )
+    decision_cols = [
+        "test_start",
+        "test_end",
+        "selected_params",
+        "train_anti_overfit_score",
+        "train_total_pnl_cents",
+        "train_sharpe",
+        "train_deflated_total_pnl_cents",
+        "train_deflated_sharpe",
+        "train_removed_top_win_cents",
+        "train_top_trade_share",
+        "train_best_month_share",
+        "train_cluster_positive_neighbors",
+        "test_total_pnl_cents",
+        "test_sharpe",
+        "test_trades",
+        "test_deflated_total_pnl_cents",
+        "test_deflated_sharpe",
+        "test_removed_top_win_cents",
+        "test_top_trade_share",
+    ]
+    st.dataframe(display_table(decisions[[c for c in decision_cols if c in decisions.columns]]), use_container_width=True, hide_index=True)
+
+    if not daily.empty:
+        date_col = daily.columns[0]
+        pnl_col = "anti_overfit_percent_wf" if "anti_overfit_percent_wf" in daily.columns else daily.columns[-1]
+        curve = daily[[date_col, pnl_col]].copy()
+        curve[date_col] = pd.to_datetime(curve[date_col])
+        curve["equity_cents"] = curve[pnl_col].fillna(0).cumsum()
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=curve[date_col], y=curve["equity_cents"], mode="lines", name="Raw OOS equity"))
+        fig.update_layout(
+            title="OOS Equity Curve: Anti-Overfit Walk-Forward",
+            xaxis_title="Date",
+            yaxis_title="Cumulative out-of-sample PnL in cents",
+            height=390,
+            margin=dict(l=10, r=10, t=45, b=10),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(
+            "This line is not training performance. It is only the next-month PnL after each monthly rebalance picked parameters from older data."
+        )
+
+    st.subheader("Trades Actually Taken")
+    st.caption(
+        "These are the real OOS trades. `move_cents` is the trigger move; `threshold_cents` is b converted into the dollar move required on that day."
+    )
+    if trades.empty:
+        st.info("No trades were taken because no monthly candidate passed the top-trade-neutral filters.")
+    else:
+        display_cols = [
+            "test_start",
+            "signal_time_dubai",
+            "entry_time_dubai",
+            "exit_time_dubai",
+            "side",
+            "move_cents",
+            "threshold_cents",
+            "daily_sigma_dollars",
+            "sigma_multiple",
+            "entry_price",
+            "exit_price",
+            "net_pnl_cents",
+            "selected_params",
+        ]
+        st.dataframe(display_table(trades[[c for c in display_cols if c in trades.columns]]), use_container_width=True, hide_index=True)
+
+    with st.expander("Full Anti-Overfit Universe And Training Rankings"):
+        st.caption(
+            "Universe = all candidates tested. Rankings = the top candidates inside each training window after applying the top-trade-neutral score."
+        )
+        st.dataframe(display_table(universe), use_container_width=True, hide_index=True)
+        st.dataframe(display_table(rankings), use_container_width=True, hide_index=True)
+
+
 def render_rare_move_tab(vol_data: dict[str, pd.DataFrame]) -> None:
     st.caption(
         "Purpose: test Shubham's original rare-spike idea directly. This keeps a, b, c, d, but changes b from a volatility multiple into a rarity percentile."
@@ -1712,10 +1913,11 @@ def main() -> None:
     data = load_outputs()
     vol_data = load_vol_outputs()
 
-    baseline_tab, stable_4var_tab, rare_move_tab, regime_rare_tab, robust_tab, fixed_diagnostic_tab, audit_tab = st.tabs(
+    baseline_tab, stable_4var_tab, anti_overfit_tab, rare_move_tab, regime_rare_tab, robust_tab, fixed_diagnostic_tab, audit_tab = st.tabs(
         [
             "Baseline Percent-Vol WF",
             "Stable 4-Variable WF",
+            "Anti-Overfit WF",
             "Rare Move WF",
             "Regime-Gated Rare WF",
             "Robust Percent-Vol WF",
@@ -1727,6 +1929,8 @@ def main() -> None:
         render_volatility_tab(vol_data, data, "percent_to_dollar")
     with stable_4var_tab:
         render_stable_4var_tab(vol_data)
+    with anti_overfit_tab:
+        render_anti_overfit_tab(vol_data)
     with rare_move_tab:
         render_rare_move_tab(vol_data)
     with regime_rare_tab:
