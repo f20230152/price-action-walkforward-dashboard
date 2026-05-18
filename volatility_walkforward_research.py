@@ -26,6 +26,10 @@ WALKFORWARD_START = pd.Timestamp("2025-11-01")
 VOL_WINDOWS_DAYS = [63]
 VOL_MIN_OBSERVATIONS = 21
 SIGMA_MULTIPLES = [0.25, 0.40, 0.55, 0.75, 1.00]
+STABLE_DELAYS = [60, 120, 300]
+STABLE_SIGMA_MULTIPLES = [0.25, 0.40, 0.55, 0.75, 1.00]
+STABLE_MOVE_WINDOWS = [900, 1800, 3600]
+STABLE_HOLDS = [3600, 7200, 14400, 21600]
 SESSION_START_HOUR_DUBAI = 11
 SESSION_END_HOUR_DUBAI = 24
 MAX_TRADES_PER_DAY = 1
@@ -75,6 +79,29 @@ def build_universe() -> list[VolParams]:
             ["percent_to_dollar"],
             ["continuation", "reversal"],
             ["exit_by_midnight"],
+        )
+    ]
+
+
+def build_stable_universe() -> list[VolParams]:
+    return [
+        VolParams(
+            delay_s=delay,
+            sigma_multiple=multiple,
+            move_window_s=lookback,
+            hold_s=hold,
+            vol_window_days=vol_window,
+            vol_method="percent_to_dollar",
+            signal_mode=mode,
+            bad_hour_rule="exit_by_midnight",
+        )
+        for delay, multiple, lookback, hold, vol_window, mode in itertools.product(
+            STABLE_DELAYS,
+            STABLE_SIGMA_MULTIPLES,
+            STABLE_MOVE_WINDOWS,
+            STABLE_HOLDS,
+            VOL_WINDOWS_DAYS,
+            ["continuation", "reversal"],
         )
     ]
 
@@ -548,6 +575,63 @@ def evaluate_robust_grid_cached(
     return pd.DataFrame(rows).sort_values(["score", "daily_sharpe", "total_pnl_cents"], ascending=False).reset_index(drop=True)
 
 
+def _index_distance(value, reference: list) -> int:
+    if value not in reference:
+        return 99
+    return int(reference.index(value))
+
+
+def add_stable_cluster_scores(grid: pd.DataFrame) -> pd.DataFrame:
+    if grid.empty:
+        return grid
+    out = grid.copy()
+    positive = (
+        (out["total_pnl_cents"] > 0)
+        & (out["daily_sharpe"] > 0)
+        & (out["top_trade_removed_pnl_cents"] > 0)
+    )
+    delay_idx = out["delay_s"].map(lambda x: _index_distance(int(x), STABLE_DELAYS))
+    sigma_idx = out["sigma_multiple"].map(lambda x: _index_distance(float(x), STABLE_SIGMA_MULTIPLES))
+    lookback_idx = out["move_window_s"].map(lambda x: _index_distance(int(x), STABLE_MOVE_WINDOWS))
+    hold_idx = out["hold_s"].map(lambda x: _index_distance(int(x), STABLE_HOLDS))
+
+    cluster_counts = []
+    cluster_positive_counts = []
+    for idx, row in out.iterrows():
+        same_family = out["signal_mode"].eq(row["signal_mode"])
+        nearby = (
+            same_family
+            & ((delay_idx - delay_idx.loc[idx]).abs() <= 1)
+            & ((sigma_idx - sigma_idx.loc[idx]).abs() <= 1)
+            & ((lookback_idx - lookback_idx.loc[idx]).abs() <= 1)
+            & ((hold_idx - hold_idx.loc[idx]).abs() <= 1)
+        )
+        nearby.loc[idx] = False
+        cluster_count = int(nearby.sum())
+        cluster_positive_count = int((nearby & positive).sum())
+        cluster_counts.append(cluster_count)
+        cluster_positive_counts.append(cluster_positive_count)
+
+    out["cluster_neighbors"] = cluster_counts
+    out["cluster_positive_neighbors"] = cluster_positive_counts
+    out["cluster_positive_rate"] = np.where(
+        out["cluster_neighbors"] > 0,
+        out["cluster_positive_neighbors"] / out["cluster_neighbors"],
+        0.0,
+    )
+    out["stable_score"] = out["score"] + 0.40 * out["cluster_positive_neighbors"] + 1.50 * out["cluster_positive_rate"]
+    return out.sort_values(["stable_score", "cluster_positive_neighbors", "daily_sharpe"], ascending=False).reset_index(drop=True)
+
+
+def evaluate_stable_grid_cached(
+    cache: dict[VolParams, tuple[pd.Series, pd.DataFrame]],
+    params: list[VolParams],
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame:
+    return add_stable_cluster_scores(evaluate_robust_grid_cached(cache, params, start, end))
+
+
 def select_robust_candidate(grid: pd.DataFrame, strict: bool = False) -> pd.Series | None:
     eligible = grid[np.isfinite(grid["score"])].copy()
     if strict and not eligible.empty:
@@ -564,6 +648,34 @@ def select_robust_candidate(grid: pd.DataFrame, strict: bool = False) -> pd.Seri
     if eligible.empty:
         return None
     return eligible.sort_values(["score", "daily_sharpe", "top_trade_removed_pnl_cents"], ascending=False).iloc[0]
+
+
+def select_stable_candidate(grid: pd.DataFrame) -> pd.Series | None:
+    if grid.empty:
+        return None
+    eligible = grid[
+        np.isfinite(grid["stable_score"])
+        & (grid["month_count"] >= 2)
+        & (grid["trades"] >= MIN_TRAIN_TRADES)
+        & (grid["total_pnl_cents"] > 0)
+        & (grid["daily_sharpe"] > 0)
+        & (grid["top_trade_removed_pnl_cents"] > 0)
+        & (grid["cluster_positive_neighbors"] >= 2)
+    ].copy()
+    if eligible.empty:
+        return None
+
+    eligible = eligible[
+        (eligible["profitable_month_rate"] >= 0.50)
+        & (eligible["top_trade_share"] <= 0.45)
+        & (eligible["best_month_share"] <= 0.50)
+    ].copy()
+    if eligible.empty:
+        return None
+    return eligible.sort_values(
+        ["stable_score", "cluster_positive_neighbors", "top_trade_removed_pnl_cents", "daily_sharpe"],
+        ascending=False,
+    ).iloc[0]
 
 
 def export_winning_percent_vol_backtest(
@@ -871,6 +983,105 @@ def run_robust_walkforward_cached(
     return decisions_df, trades_df, daily_oos, rankings_df
 
 
+def run_stable_walkforward_cached(
+    cache: dict[VolParams, tuple[pd.Series, pd.DataFrame]],
+    bars: pd.DataFrame,
+    params: list[VolParams],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.DataFrame]:
+    run_key = "stable_4var_percent"
+    run_label = "Stable 4-variable percent-vol walk-forward"
+    decisions = []
+    trades_list = []
+    daily_list = []
+    rankings = []
+
+    for train_start, train_end, test_start, test_end in period_schedule(bars, "monthly"):
+        grid = evaluate_stable_grid_cached(cache, params, train_start, train_end)
+        selected = select_stable_candidate(grid)
+        top = grid.drop(columns=["params_obj"]).head(50).copy()
+        top["run_key"] = run_key
+        top["run_label"] = run_label
+        top["objective"] = "stable_4var_score"
+        top["train_start"] = train_start.date().isoformat()
+        top["train_end"] = train_end.date().isoformat()
+        top["test_start"] = test_start.date().isoformat()
+        top["test_end"] = test_end.date().isoformat()
+        rankings.append(top)
+
+        if selected is None:
+            decisions.append(
+                {
+                    "run_key": run_key,
+                    "run_label": run_label,
+                    "objective": "stable_4var_score",
+                    "train_start": train_start.date().isoformat(),
+                    "train_end": train_end.date().isoformat(),
+                    "test_start": test_start.date().isoformat(),
+                    "test_end": test_end.date().isoformat(),
+                    "selected_params": "NO_STABLE_CANDIDATE",
+                    "test_total_pnl_cents": 0.0,
+                    "test_sharpe": 0.0,
+                    "test_trades": 0,
+                }
+            )
+            continue
+
+        p: VolParams = selected["params_obj"]
+        daily_full, trades_full = cache[p]
+        daily = slice_daily(daily_full, test_start, test_end)
+        trades = slice_trades(trades_full, test_start, test_end)
+        metrics = compute_metrics(daily, trades)
+        concentration = concentration_metrics(daily, trades)
+        daily_list.append(daily)
+        if not trades.empty:
+            out_trades = trades.copy()
+            out_trades["run_key"] = run_key
+            out_trades["run_label"] = run_label
+            out_trades["objective"] = "stable_4var_score"
+            out_trades["test_start"] = test_start.date().isoformat()
+            out_trades["test_end"] = test_end.date().isoformat()
+            out_trades["selected_params"] = p.label
+            trades_list.append(out_trades)
+
+        decisions.append(
+            {
+                "run_key": run_key,
+                "run_label": run_label,
+                "objective": "stable_4var_score",
+                "train_start": train_start.date().isoformat(),
+                "train_end": train_end.date().isoformat(),
+                "test_start": test_start.date().isoformat(),
+                "test_end": test_end.date().isoformat(),
+                "selected_params": p.label,
+                "train_stable_score": float(selected["stable_score"]),
+                "train_total_pnl_cents": float(selected["total_pnl_cents"]),
+                "train_sharpe": float(selected["daily_sharpe"]),
+                "train_trades": int(selected["trades"]),
+                "train_profitable_month_rate": float(selected["profitable_month_rate"]),
+                "train_top_trade_share": float(selected["top_trade_share"]),
+                "train_best_month_share": float(selected["best_month_share"]),
+                "train_top_trade_removed_pnl_cents": float(selected["top_trade_removed_pnl_cents"]),
+                "train_cluster_positive_neighbors": int(selected["cluster_positive_neighbors"]),
+                "train_cluster_positive_rate": float(selected["cluster_positive_rate"]),
+                "test_total_pnl_cents": metrics["total_pnl_cents"],
+                "test_sharpe": metrics["daily_sharpe"],
+                "test_trades": metrics["trades"],
+                "test_win_rate": metrics["win_rate"],
+                "test_max_drawdown_cents": metrics["max_drawdown_cents"],
+                "test_profitable_month_rate": concentration["profitable_month_rate"],
+                "test_top_trade_share": concentration["top_trade_share"],
+                "test_best_month_share": concentration["best_month_share"],
+                "test_top_trade_removed_pnl_cents": concentration["top_trade_removed_pnl_cents"],
+            }
+        )
+
+    daily_oos = pd.concat(daily_list).sort_index().groupby(level=0).sum() if daily_list else pd.Series(dtype=float, name="daily_pnl_cents")
+    trades_df = pd.concat(trades_list, ignore_index=True) if trades_list else pd.DataFrame()
+    decisions_df = pd.DataFrame(decisions)
+    rankings_df = pd.concat(rankings, ignore_index=True) if rankings else pd.DataFrame()
+    return decisions_df, trades_df, daily_oos, rankings_df
+
+
 def monthly_audit_rows(daily: pd.Series, trades: pd.DataFrame, run_key: str, run_label: str) -> list[dict]:
     if daily.empty:
         return []
@@ -1034,6 +1245,32 @@ def main() -> None:
         if not top_trades.empty:
             all_top_trades.append(top_trades)
 
+    stable_params = build_stable_universe()
+    pd.DataFrame([p.__dict__ | {"label": p.label} for p in stable_params]).to_csv(OUT_DIR / "stable_parameter_universe.csv", index=False)
+    print("precomputing stable 4-variable candidates", len(stable_params), flush=True)
+    stable_cache = precompute_results(days, stable_params)
+    stable_decisions, stable_trades, stable_daily, stable_rankings = run_stable_walkforward_cached(stable_cache, bars, stable_params)
+    stable_metrics = compute_metrics(stable_daily, stable_trades)
+    stable_concentration = concentration_metrics(stable_daily, stable_trades)
+    stable_run_key = "stable_4var_percent"
+    stable_run_label = "Stable 4-variable percent-vol walk-forward"
+    stable_metrics_df = pd.DataFrame(
+        [
+            {
+                "run_key": stable_run_key,
+                "run_label": stable_run_label,
+                "objective": "stable_4var_score",
+                **stable_metrics,
+                **stable_concentration,
+            }
+        ]
+    )
+    all_monthly_audit.extend(monthly_audit_rows(stable_daily, stable_trades, stable_run_key, stable_run_label))
+    all_repeated_clocks.extend(repeated_clock_rows(stable_trades, stable_run_key, stable_run_label))
+    top_trades = top_trade_rows(stable_trades, stable_run_key, stable_run_label)
+    if not top_trades.empty:
+        all_top_trades.append(top_trades)
+
     pd.DataFrame(all_metrics).sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False).to_csv(OUT_DIR / "metrics.csv", index=False)
     (pd.concat(all_decisions, ignore_index=True) if all_decisions else pd.DataFrame()).to_csv(OUT_DIR / "decisions.csv", index=False)
     (pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()).to_csv(OUT_DIR / "trades.csv", index=False)
@@ -1048,6 +1285,11 @@ def main() -> None:
     (pd.concat(all_robust_trades, ignore_index=True) if all_robust_trades else pd.DataFrame()).to_csv(OUT_DIR / "robust_trades.csv", index=False)
     pd.concat(all_robust_daily, axis=1).to_csv(OUT_DIR / "robust_daily_pnl.csv")
     (pd.concat(all_robust_rankings, ignore_index=True) if all_robust_rankings else pd.DataFrame()).to_csv(OUT_DIR / "robust_train_rankings.csv", index=False)
+    stable_metrics_df.to_csv(OUT_DIR / "stable_4var_metrics.csv", index=False)
+    stable_decisions.to_csv(OUT_DIR / "stable_4var_decisions.csv", index=False)
+    stable_trades.to_csv(OUT_DIR / "stable_4var_trades.csv", index=False)
+    stable_daily.rename(stable_run_key).to_csv(OUT_DIR / "stable_4var_daily_pnl.csv")
+    stable_rankings.to_csv(OUT_DIR / "stable_4var_train_rankings.csv", index=False)
     pd.DataFrame(all_monthly_audit).to_csv(OUT_DIR / "stability_monthly_audit.csv", index=False)
     pd.DataFrame(all_repeated_clocks).to_csv(OUT_DIR / "stability_repeated_clocks.csv", index=False)
     (pd.concat(all_top_trades, ignore_index=True) if all_top_trades else pd.DataFrame()).to_csv(OUT_DIR / "stability_top_trades.csv", index=False)
@@ -1058,11 +1300,16 @@ def main() -> None:
                 "data_end": str(bars.index.max()),
                 "raw_files": int(len(stats)),
                 "candidate_count": int(len(params)),
+                "stable_4var_candidate_count": int(len(stable_params)),
                 "train_months": TRAIN_MONTHS,
                 "rebalance_options": "monthly",
                 "vol_methods": "percent_to_dollar",
                 "vol_windows_days": "63",
                 "sigma_multiples": ",".join(f"{x:g}" for x in SIGMA_MULTIPLES),
+                "stable_4var_a_delay_seconds": ",".join(str(x) for x in STABLE_DELAYS),
+                "stable_4var_b_sigma_multiples": ",".join(f"{x:g}" for x in STABLE_SIGMA_MULTIPLES),
+                "stable_4var_c_move_windows_seconds": ",".join(str(x) for x in STABLE_MOVE_WINDOWS),
+                "stable_4var_d_hold_seconds": ",".join(str(x) for x in STABLE_HOLDS),
                 "walkforward_test_start": WALKFORWARD_START.date().isoformat(),
                 "early_rebalance_training": "Nov uses Oct only; Dec uses Oct-Nov; Jan onward uses rolling 3 months",
                 "vol_min_observations": VOL_MIN_OBSERVATIONS,

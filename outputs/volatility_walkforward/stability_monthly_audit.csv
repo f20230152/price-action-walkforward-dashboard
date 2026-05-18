@@ -25,3 +25,6 @@ robust_percent_reversal,Robust percent-vol: reversal only,2025-12-01,-9.49520000
 robust_percent_reversal,Robust percent-vol: reversal only,2026-01-01,-16.749999999998934,-0.008811815808533768,20
 robust_percent_reversal,Robust percent-vol: reversal only,2026-02-01,-25.307199999997522,-0.013313575225654814,6
 robust_percent_reversal,Robust percent-vol: reversal only,2026-03-01,2003.6087999999995,1.054055623758716,18
+stable_4var_percent,Stable 4-variable percent-vol walk-forward,2026-01-01,360.29720000000276,-0.2667421812765257,10
+stable_4var_percent,Stable 4-variable percent-vol walk-forward,2026-02-01,436.1572000000025,-0.3229043215086369,20
+stable_4var_percent,Stable 4-variable percent-vol walk-forward,2026-03-01,-2147.1864000000005,1.5896465027851627,19

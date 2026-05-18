@@ -155,6 +155,12 @@ def load_vol_outputs() -> dict[str, pd.DataFrame]:
         "stability_monthly": "stability_monthly_audit.csv",
         "stability_repeated": "stability_repeated_clocks.csv",
         "stability_top_trades": "stability_top_trades.csv",
+        "stable_4var_metrics": "stable_4var_metrics.csv",
+        "stable_4var_decisions": "stable_4var_decisions.csv",
+        "stable_4var_trades": "stable_4var_trades.csv",
+        "stable_4var_daily": "stable_4var_daily_pnl.csv",
+        "stable_4var_rankings": "stable_4var_train_rankings.csv",
+        "stable_4var_universe": "stable_parameter_universe.csv",
     }
     out = {}
     for key, name in files.items():
@@ -812,6 +818,163 @@ def render_robust_walkforward_tab(vol_data: dict[str, pd.DataFrame]) -> None:
         st.dataframe(display_table(rankings[rankings["run_key"] == run_key]), use_container_width=True, hide_index=True)
 
 
+def render_stable_4var_tab(vol_data: dict[str, pd.DataFrame]) -> None:
+    st.caption(
+        "Purpose: find a steadier version of the same spike idea by optimizing the four variables a, b, c, and d, then rejecting fragile winners."
+    )
+    st.info(
+        "Simple: the strategy only trades next month if the past training window shows a parameter set that made money without depending on one lucky trade, "
+        "one lucky month, or one exact magic number. Technical: each monthly rebalance searches a wider parameter grid and selects by a stability score using "
+        "Sharpe, PnL after removing the best trade, profitable-month rate, drawdown, concentration penalties, and nearby-parameter cluster support."
+    )
+
+    metrics = vol_data["stable_4var_metrics"]
+    decisions = vol_data["stable_4var_decisions"]
+    trades = vol_data["stable_4var_trades"]
+    daily = vol_data["stable_4var_daily"]
+    rankings = vol_data["stable_4var_rankings"]
+    universe = vol_data["stable_4var_universe"]
+
+    if metrics.empty:
+        st.warning("Stable 4-variable outputs are missing. Run `python volatility_walkforward_research.py` first.")
+        return
+
+    st.subheader("What The Four Variables Mean")
+    variable_rows = pd.DataFrame(
+        [
+            {
+                "variable": "a = entry delay",
+                "simple_explanation": "After a spike is detected, wait this many seconds before entering.",
+                "technical_explanation": "Entry index = signal index + a seconds. Tested values: 60, 120, 300 seconds.",
+            },
+            {
+                "variable": "b = volatility multiple",
+                "simple_explanation": "How big the move must be before it counts as a real spike.",
+                "technical_explanation": "Threshold = b x rolling 63-session percent-return sigma converted to dollars. Tested values: 0.25x, 0.40x, 0.55x, 0.75x, 1.00x.",
+            },
+            {
+                "variable": "c = move window",
+                "simple_explanation": "The number of seconds over which the price move is measured.",
+                "technical_explanation": "Signal move = price_now - price_c_seconds_ago. Tested values: 900, 1800, 3600 seconds.",
+            },
+            {
+                "variable": "d = holding time",
+                "simple_explanation": "How long the position is held after entry, unless midnight Dubai comes first.",
+                "technical_explanation": "Exit index = entry index + d seconds, capped by the hard 24:00 Dubai exit. Tested values: 3600, 7200, 14400, 21600 seconds.",
+            },
+        ]
+    )
+    st.dataframe(variable_rows, use_container_width=True, hide_index=True)
+
+    row = metrics.iloc[0]
+    st.subheader("Stable 4-Variable Walk-Forward Result")
+    metric_tiles(row)
+    st.caption(
+        "Read this as true out-of-sample performance. The selected parameters for each month were chosen only from prior data. "
+        "If the optimizer found no stable candidate, it sat out that month."
+    )
+    if float(row.get("total_pnl_cents", 0.0)) <= 0 or float(row.get("top_trade_removed_pnl_cents", 0.0)) <= 0:
+        st.error(
+            "Conclusion: the expanded 4-variable stability test did not find a tradeable stable strategy on this dataset. "
+            "Simple: even after asking the optimizer to avoid lucky one-trade or one-month winners, the OOS curve still broke. "
+            "Technical: the selected training parameters passed in-sample concentration and neighborhood checks, but failed in the next unseen month, "
+            "so the current spike logic is regime-sensitive and should not be considered robust without more data or an additional regime/risk filter."
+        )
+
+    metric_cols = [
+        "run_label",
+        "total_pnl_cents",
+        "daily_sharpe",
+        "max_drawdown_cents",
+        "trades",
+        "win_rate",
+        "profit_factor",
+        "profitable_month_rate",
+        "top_trade_share",
+        "best_month_share",
+        "top_trade_removed_pnl_cents",
+    ]
+    st.dataframe(display_table(metrics[[c for c in metric_cols if c in metrics.columns]]), use_container_width=True, hide_index=True)
+
+    st.subheader("Monthly Parameter Decisions")
+    st.caption(
+        "Simple: this table explains what the strategy decided before each month. Technical: train columns are in-sample selection diagnostics; "
+        "test columns are the next-month OOS result using the selected parameter."
+    )
+    decision_cols = [
+        "test_start",
+        "test_end",
+        "selected_params",
+        "train_stable_score",
+        "train_total_pnl_cents",
+        "train_sharpe",
+        "train_top_trade_removed_pnl_cents",
+        "train_top_trade_share",
+        "train_best_month_share",
+        "train_cluster_positive_neighbors",
+        "train_cluster_positive_rate",
+        "test_total_pnl_cents",
+        "test_sharpe",
+        "test_trades",
+        "test_top_trade_removed_pnl_cents",
+        "test_top_trade_share",
+    ]
+    st.dataframe(display_table(decisions[[c for c in decision_cols if c in decisions.columns]]), use_container_width=True, hide_index=True)
+
+    if not daily.empty:
+        date_col = daily.columns[0]
+        pnl_col = "stable_4var_percent" if "stable_4var_percent" in daily.columns else daily.columns[-1]
+        curve = daily[[date_col, pnl_col]].copy()
+        curve[date_col] = pd.to_datetime(curve[date_col])
+        curve["equity_cents"] = curve[pnl_col].fillna(0).cumsum()
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=curve[date_col], y=curve["equity_cents"], mode="lines", name="Stable 4-variable OOS equity"))
+        fig.update_layout(
+            title="OOS Equity Curve: Stable 4-Variable Strategy",
+            xaxis_title="Date",
+            yaxis_title="Cumulative out-of-sample PnL in cents",
+            height=390,
+            margin=dict(l=10, r=10, t=45, b=10),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(
+            "Simple: a smoother upward line would mean the strategy is making money repeatedly. Technical: this is the cumulative sum of daily OOS PnL "
+            "from each monthly test period, excluding training PnL."
+        )
+
+    st.subheader("Trades Taken")
+    st.caption(
+        "Each row is one actual OOS trade generated by the stable walk-forward decision for that month. "
+        "`move_cents` is the spike that triggered the signal; `threshold_cents` is the volatility-scaled trigger level."
+    )
+    if trades.empty:
+        st.info("No trades were taken because no stable candidate passed the filters.")
+    else:
+        display_cols = [
+            "test_start",
+            "signal_time_dubai",
+            "entry_time_dubai",
+            "exit_time_dubai",
+            "side",
+            "move_cents",
+            "threshold_cents",
+            "daily_sigma_dollars",
+            "sigma_multiple",
+            "entry_price",
+            "exit_price",
+            "net_pnl_cents",
+            "selected_params",
+        ]
+        st.dataframe(display_table(trades[[c for c in display_cols if c in trades.columns]]), use_container_width=True, hide_index=True)
+
+    with st.expander("Full Stable Parameter Universe And Training Rankings"):
+        st.caption(
+            "Universe = every a/b/c/d candidate tested before walk-forward selection. Rankings = top training candidates seen before each OOS month."
+        )
+        st.dataframe(display_table(universe), use_container_width=True, hide_index=True)
+        st.dataframe(display_table(rankings), use_container_width=True, hide_index=True)
+
+
 def render_stability_audit_tab(vol_data: dict[str, pd.DataFrame]) -> None:
     st.caption(
         "This tab is for distrust. It shows whether PnL is coming from one month, one trade, or repeated clock-time artifacts."
@@ -1231,9 +1394,10 @@ def main() -> None:
     data = load_outputs()
     vol_data = load_vol_outputs()
 
-    baseline_tab, robust_tab, fixed_diagnostic_tab, audit_tab = st.tabs(
+    baseline_tab, stable_4var_tab, robust_tab, fixed_diagnostic_tab, audit_tab = st.tabs(
         [
             "Baseline Percent-Vol WF",
+            "Stable 4-Variable WF",
             "Robust Percent-Vol WF",
             "Fixed Winner Diagnostic",
             "Stability Audit",
@@ -1241,6 +1405,8 @@ def main() -> None:
     )
     with baseline_tab:
         render_volatility_tab(vol_data, data, "percent_to_dollar")
+    with stable_4var_tab:
+        render_stable_4var_tab(vol_data)
     with robust_tab:
         render_robust_walkforward_tab(vol_data)
     with fixed_diagnostic_tab:
