@@ -161,6 +161,12 @@ def load_vol_outputs() -> dict[str, pd.DataFrame]:
         "stable_4var_daily": "stable_4var_daily_pnl.csv",
         "stable_4var_rankings": "stable_4var_train_rankings.csv",
         "stable_4var_universe": "stable_parameter_universe.csv",
+        "rare_move_metrics": "rare_move_metrics.csv",
+        "rare_move_decisions": "rare_move_decisions.csv",
+        "rare_move_trades": "rare_move_trades.csv",
+        "rare_move_daily": "rare_move_daily_pnl.csv",
+        "rare_move_rankings": "rare_move_train_rankings.csv",
+        "rare_move_universe": "rare_move_parameter_universe.csv",
     }
     out = {}
     for key, name in files.items():
@@ -975,6 +981,160 @@ def render_stable_4var_tab(vol_data: dict[str, pd.DataFrame]) -> None:
         st.dataframe(display_table(rankings), use_container_width=True, hide_index=True)
 
 
+def render_rare_move_tab(vol_data: dict[str, pd.DataFrame]) -> None:
+    st.caption(
+        "Purpose: test Shubham's original rare-spike idea directly. This keeps a, b, c, d, but changes b from a volatility multiple into a rarity percentile."
+    )
+    st.info(
+        "Simple: instead of saying 'trade after a 55% daily-vol move', this asks 'is this move larger than 95%, 97.5%, or 99% of recent intraday moves?' "
+        "Technical: for each c-second window, the threshold is the rolling percentile of absolute c-second intraday moves from the prior 63 sessions. "
+        "The current month is never used to set its own threshold or parameters."
+    )
+
+    metrics = vol_data["rare_move_metrics"]
+    decisions = vol_data["rare_move_decisions"]
+    trades = vol_data["rare_move_trades"]
+    daily = vol_data["rare_move_daily"]
+    rankings = vol_data["rare_move_rankings"]
+    universe = vol_data["rare_move_universe"]
+
+    if metrics.empty:
+        st.warning("Rare move walk-forward outputs are missing. Run `python volatility_walkforward_research.py` first.")
+        return
+
+    st.subheader("What The Four Variables Mean Here")
+    variable_rows = pd.DataFrame(
+        [
+            {
+                "variable": "a = entry delay",
+                "simple_explanation": "Wait this many seconds after a rare move is detected before entering.",
+                "technical_explanation": "Entry time = signal time + a. Tested values: 60, 120, 300 seconds.",
+            },
+            {
+                "variable": "b = rarity percentile",
+                "simple_explanation": "Only trade moves that are unusually large compared with recent intraday moves.",
+                "technical_explanation": "Threshold = rolling 95th, 97.5th, or 99th percentile of absolute c-second moves over the prior 63 sessions.",
+            },
+            {
+                "variable": "c = move window",
+                "simple_explanation": "The time bucket used to measure the spike.",
+                "technical_explanation": "Signal move = price_now - price_c_seconds_ago. Tested values: 300, 900, 1800, 3600 seconds.",
+            },
+            {
+                "variable": "d = holding time",
+                "simple_explanation": "How long to hold after entry, unless the Dubai midnight hard stop exits first.",
+                "technical_explanation": "Exit = entry + d seconds, capped at 24:00 Dubai. Tested values: 3600, 7200, 14400, 21600 seconds.",
+            },
+        ]
+    )
+    st.dataframe(variable_rows, use_container_width=True, hide_index=True)
+
+    row = metrics.iloc[0]
+    st.subheader("Rare Move Walk-Forward Result")
+    metric_tiles(row)
+    if float(row.get("total_pnl_cents", 0.0)) <= 0 or float(row.get("top_trade_removed_pnl_cents", 0.0)) <= 0:
+        st.error(
+            "Conclusion: the rare-move version did not produce a robust tradeable result on this data. "
+            "Simple: filtering for rare moves alone was not enough to create steady growth. "
+            "Technical: the walk-forward OOS result failed the stability requirement because total PnL or PnL after removing the best trade is not positive."
+        )
+    else:
+        st.success(
+            "Conclusion: this rare-move version passed the first stability check. It still needs inspection for month and trade concentration before live use."
+        )
+
+    metric_cols = [
+        "run_label",
+        "total_pnl_cents",
+        "daily_sharpe",
+        "max_drawdown_cents",
+        "trades",
+        "win_rate",
+        "profit_factor",
+        "profitable_month_rate",
+        "top_trade_share",
+        "best_month_share",
+        "top_trade_removed_pnl_cents",
+    ]
+    st.dataframe(display_table(metrics[[c for c in metric_cols if c in metrics.columns]]), use_container_width=True, hide_index=True)
+
+    st.subheader("Monthly Walk-Forward Decisions")
+    st.caption(
+        "Simple: each row shows what parameters were selected before that month and what happened in that unseen month. "
+        "Technical: `train_*` columns are computed only on the prior training window; `test_*` columns are out-of-sample."
+    )
+    decision_cols = [
+        "test_start",
+        "test_end",
+        "selected_params",
+        "train_rare_stability_score",
+        "train_total_pnl_cents",
+        "train_sharpe",
+        "train_top_trade_removed_pnl_cents",
+        "train_top_trade_share",
+        "train_best_month_share",
+        "train_cluster_positive_neighbors",
+        "train_cluster_positive_rate",
+        "test_total_pnl_cents",
+        "test_sharpe",
+        "test_trades",
+        "test_top_trade_removed_pnl_cents",
+        "test_top_trade_share",
+    ]
+    st.dataframe(display_table(decisions[[c for c in decision_cols if c in decisions.columns]]), use_container_width=True, hide_index=True)
+
+    if not daily.empty:
+        date_col = daily.columns[0]
+        pnl_col = "rare_move_percentile_wf" if "rare_move_percentile_wf" in daily.columns else daily.columns[-1]
+        curve = daily[[date_col, pnl_col]].copy()
+        curve[date_col] = pd.to_datetime(curve[date_col])
+        curve["equity_cents"] = curve[pnl_col].fillna(0).cumsum()
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=curve[date_col], y=curve["equity_cents"], mode="lines", name="Rare move OOS equity"))
+        fig.update_layout(
+            title="OOS Equity Curve: Rare Move Strategy",
+            xaxis_title="Date",
+            yaxis_title="Cumulative out-of-sample PnL in cents",
+            height=390,
+            margin=dict(l=10, r=10, t=45, b=10),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(
+            "Simple: this line should grow steadily if rare moves create a repeatable edge. "
+            "Technical: cumulative daily OOS PnL from the monthly walk-forward test periods only."
+        )
+
+    st.subheader("Trades Taken")
+    st.caption(
+        "`rarity_percentile` is the threshold percentile selected from training. `threshold_cents` is the actual rolling percentile threshold for that day and window."
+    )
+    if trades.empty:
+        st.info("No trades were taken because no stable rare-move candidate passed the filters.")
+    else:
+        display_cols = [
+            "test_start",
+            "signal_time_dubai",
+            "entry_time_dubai",
+            "exit_time_dubai",
+            "side",
+            "move_cents",
+            "threshold_cents",
+            "rarity_percentile",
+            "entry_price",
+            "exit_price",
+            "net_pnl_cents",
+            "selected_params",
+        ]
+        st.dataframe(display_table(trades[[c for c in display_cols if c in trades.columns]]), use_container_width=True, hide_index=True)
+
+    with st.expander("Rare Move Universe And Training Rankings"):
+        st.caption(
+            "Universe = every rare-move a/b/c/d candidate tested. Rankings = top training candidates before each OOS month."
+        )
+        st.dataframe(display_table(universe), use_container_width=True, hide_index=True)
+        st.dataframe(display_table(rankings), use_container_width=True, hide_index=True)
+
+
 def render_stability_audit_tab(vol_data: dict[str, pd.DataFrame]) -> None:
     st.caption(
         "This tab is for distrust. It shows whether PnL is coming from one month, one trade, or repeated clock-time artifacts."
@@ -1394,10 +1554,11 @@ def main() -> None:
     data = load_outputs()
     vol_data = load_vol_outputs()
 
-    baseline_tab, stable_4var_tab, robust_tab, fixed_diagnostic_tab, audit_tab = st.tabs(
+    baseline_tab, stable_4var_tab, rare_move_tab, robust_tab, fixed_diagnostic_tab, audit_tab = st.tabs(
         [
             "Baseline Percent-Vol WF",
             "Stable 4-Variable WF",
+            "Rare Move WF",
             "Robust Percent-Vol WF",
             "Fixed Winner Diagnostic",
             "Stability Audit",
@@ -1407,6 +1568,8 @@ def main() -> None:
         render_volatility_tab(vol_data, data, "percent_to_dollar")
     with stable_4var_tab:
         render_stable_4var_tab(vol_data)
+    with rare_move_tab:
+        render_rare_move_tab(vol_data)
     with robust_tab:
         render_robust_walkforward_tab(vol_data)
     with fixed_diagnostic_tab:

@@ -30,6 +30,12 @@ STABLE_DELAYS = [60, 120, 300]
 STABLE_SIGMA_MULTIPLES = [0.25, 0.40, 0.55, 0.75, 1.00]
 STABLE_MOVE_WINDOWS = [900, 1800, 3600]
 STABLE_HOLDS = [3600, 7200, 14400, 21600]
+RARE_DELAYS = [60, 120, 300]
+RARE_PERCENTILES = [95.0, 97.5, 99.0]
+RARE_MOVE_WINDOWS = [300, 900, 1800, 3600]
+RARE_HOLDS = [3600, 7200, 14400, 21600]
+RARE_LOOKBACK_DAYS = 63
+RARE_MIN_OBSERVATIONS = 500
 SESSION_START_HOUR_DUBAI = 11
 SESSION_END_HOUR_DUBAI = 24
 MAX_TRADES_PER_DAY = 1
@@ -58,6 +64,24 @@ class VolParams:
         )
 
 
+@dataclass(frozen=True)
+class RareMoveParams:
+    delay_s: int
+    percentile: float
+    move_window_s: int
+    hold_s: int
+    signal_mode: str
+    bad_hour_rule: str
+
+    @property
+    def label(self) -> str:
+        percentile_label = f"{self.percentile:g}th percentile"
+        return (
+            f"a={self.delay_s}s | move>{percentile_label} of recent {self.move_window_s}s moves | "
+            f"hold={self.hold_s}s | {self.signal_mode} | {self.bad_hour_rule}"
+        )
+
+
 def build_universe() -> list[VolParams]:
     return [
         VolParams(
@@ -79,6 +103,26 @@ def build_universe() -> list[VolParams]:
             ["percent_to_dollar"],
             ["continuation", "reversal"],
             ["exit_by_midnight"],
+        )
+    ]
+
+
+def build_rare_universe() -> list[RareMoveParams]:
+    return [
+        RareMoveParams(
+            delay_s=delay,
+            percentile=percentile,
+            move_window_s=lookback,
+            hold_s=hold,
+            signal_mode=mode,
+            bad_hour_rule="exit_by_midnight",
+        )
+        for delay, percentile, lookback, hold, mode in itertools.product(
+            RARE_DELAYS,
+            RARE_PERCENTILES,
+            RARE_MOVE_WINDOWS,
+            RARE_HOLDS,
+            ["continuation", "reversal"],
         )
     ]
 
@@ -159,6 +203,40 @@ def _day_scalar(day_bars: pd.DataFrame, col: str) -> float:
         return np.nan
     values = day_bars[col].dropna()
     return float(values.iloc[0]) if not values.empty else np.nan
+
+
+def add_rare_move_thresholds(days: list[dict]) -> list[dict]:
+    enriched = []
+    history: dict[int, list[np.ndarray]] = {window: [] for window in RARE_MOVE_WINDOWS}
+    start_seconds = SESSION_START_HOUR_DUBAI * 3600
+    for day in days:
+        day = dict(day)
+        prices = day["prices"]
+        dubai_seconds = day["dubai_seconds"]
+        n = len(prices)
+
+        for window in RARE_MOVE_WINDOWS:
+            prior = history[window][-RARE_LOOKBACK_DAYS:]
+            sample = np.concatenate(prior) if prior else np.asarray([], dtype=float)
+            for percentile in RARE_PERCENTILES:
+                key = f"rare_threshold_{window}_{percentile:g}"
+                day[key] = float(np.percentile(sample, percentile)) if sample.size >= RARE_MIN_OBSERVATIONS else np.nan
+
+            if n > window + 2:
+                idx = np.arange(window, n)
+                keep = (dubai_seconds[idx] >= start_seconds) & (dubai_seconds[idx] < 24 * 3600)
+                if REQUIRE_FULL_SIGNAL_WINDOW_IN_SESSION:
+                    keep = keep & (dubai_seconds[idx - window] >= start_seconds)
+                if np.any(keep):
+                    deltas = np.abs(prices[idx[keep]] - prices[idx[keep] - window])
+                    history[window].append(deltas.astype(float))
+                else:
+                    history[window].append(np.asarray([], dtype=float))
+            else:
+                history[window].append(np.asarray([], dtype=float))
+
+        enriched.append(day)
+    return enriched
 
 
 def backtest_days(days: list[dict], params: VolParams, collect_trades: bool = False) -> tuple[pd.DataFrame, pd.Series, dict]:
@@ -266,6 +344,125 @@ def scan_day(day: dict, params: VolParams, sigma_col: str, collect_trades: bool)
                     "threshold_cents": threshold_cents,
                     "daily_sigma_dollars": sigma,
                     "sigma_multiple": params.sigma_multiple,
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "gross_pnl_cents": gross_cents,
+                    "cost_cents": cost_cents,
+                    "net_pnl_cents": net_cents,
+                    "bad_hour_rule": params.bad_hour_rule,
+                    "signal_mode": params.signal_mode,
+                    "params": params.label,
+                }
+            )
+        last_exit = exit_idx
+        i = int(np.searchsorted(raw_idx, last_exit - params.delay_s + 1, side="left"))
+
+    return trades, pnls, sides
+
+
+def backtest_rare_days(days: list[dict], params: RareMoveParams, collect_trades: bool = False) -> tuple[pd.DataFrame, pd.Series, dict]:
+    trades: list[dict] = []
+    pnls: list[float] = []
+    sides: list[int] = []
+    daily_values = []
+    daily_index = []
+
+    for day in days:
+        day_trades, day_pnls, day_sides = scan_rare_day(day, params, collect_trades)
+        if collect_trades and day_trades:
+            trades.extend(day_trades)
+        pnls.extend(day_pnls)
+        sides.extend(day_sides)
+        daily_index.append(day["date"])
+        daily_values.append(float(np.sum(day_pnls)) if day_pnls else 0.0)
+
+    daily = pd.Series(daily_values, index=pd.Index(daily_index, name="date"), name="daily_pnl_cents")
+    trades_df = pd.DataFrame(trades) if trades else pd.DataFrame()
+    return trades_df, daily, _trade_summary(pnls, sides)
+
+
+def scan_rare_day(day: dict, params: RareMoveParams, collect_trades: bool) -> tuple[list[dict], list[float], list[int]]:
+    threshold_dollars = day.get(f"rare_threshold_{params.move_window_s}_{params.percentile:g}", np.nan)
+    if not np.isfinite(threshold_dollars) or threshold_dollars <= 0:
+        return [], [], []
+
+    prices = day["prices"]
+    times = day["times"]
+    dubai_times = day["dubai_times"]
+    dubai_seconds = day["dubai_seconds"]
+    n = len(prices)
+    min_required = params.move_window_s + params.delay_s + 2
+    if n <= min_required:
+        return [], [], []
+
+    delta = prices[params.move_window_s :] - prices[: -params.move_window_s]
+    raw_idx = np.flatnonzero(np.abs(delta) >= threshold_dollars) + params.move_window_s
+    if raw_idx.size == 0:
+        return [], [], []
+
+    start_seconds = SESSION_START_HOUR_DUBAI * 3600
+    keep = (dubai_seconds[raw_idx] >= start_seconds) & (dubai_seconds[raw_idx] < 24 * 3600)
+    if REQUIRE_FULL_SIGNAL_WINDOW_IN_SESSION:
+        lookback_start_idx = raw_idx - params.move_window_s
+        keep = keep & (dubai_seconds[lookback_start_idx] >= start_seconds)
+    raw_idx = raw_idx[keep]
+    if raw_idx.size == 0:
+        return [], [], []
+
+    trades = []
+    pnls = []
+    sides = []
+    last_exit = -1
+    i = 0
+    threshold_cents = threshold_dollars * 100.0
+    while i < raw_idx.size:
+        if len(pnls) >= MAX_TRADES_PER_DAY:
+            break
+        event_idx = int(raw_idx[i])
+        entry_idx = event_idx + params.delay_s
+        exit_idx = entry_idx + params.hold_s
+        if entry_idx >= n:
+            break
+        if entry_idx <= last_exit:
+            i = int(np.searchsorted(raw_idx, last_exit - params.delay_s + 1, side="left"))
+            continue
+
+        if exit_idx >= n:
+            break
+        adjusted_exit_idx = apply_bad_hour_rule(times, dubai_times, entry_idx, exit_idx, params.bad_hour_rule)
+        if adjusted_exit_idx is None:
+            i += 1
+            continue
+        exit_idx = adjusted_exit_idx
+        if exit_idx <= entry_idx:
+            i += 1
+            continue
+
+        move = prices[event_idx] - prices[event_idx - params.move_window_s]
+        side = 1 if move > 0 else -1
+        if params.signal_mode == "reversal":
+            side *= -1
+
+        entry_price = float(prices[entry_idx])
+        exit_price = float(prices[exit_idx])
+        gross_cents = side * (exit_price - entry_price) * 100.0
+        cost_cents = abs(entry_price) * DYNAMIC_COST_CENTS_PER_PRICE_UNIT
+        net_cents = gross_cents - cost_cents
+        pnls.append(float(net_cents))
+        sides.append(side)
+        if collect_trades:
+            trades.append(
+                {
+                    "signal_time": pd.Timestamp(times[event_idx]),
+                    "signal_time_dubai": pd.Timestamp(dubai_times[event_idx]),
+                    "entry_time": pd.Timestamp(times[entry_idx]),
+                    "entry_time_dubai": pd.Timestamp(dubai_times[entry_idx]),
+                    "exit_time": pd.Timestamp(times[exit_idx]),
+                    "exit_time_dubai": pd.Timestamp(dubai_times[exit_idx]),
+                    "side": side,
+                    "move_cents": move * 100.0,
+                    "threshold_cents": threshold_cents,
+                    "rarity_percentile": params.percentile,
                     "entry_price": entry_price,
                     "exit_price": exit_price,
                     "gross_pnl_cents": gross_cents,
@@ -399,6 +596,16 @@ def precompute_results(days: list[dict], params: list[VolParams]) -> dict[VolPar
         if idx % 25 == 0:
             print("precomputed", idx, "of", len(params), flush=True)
         trades, daily, _ = backtest_days(days, p, collect_trades=True)
+        out[p] = (daily, trades)
+    return out
+
+
+def precompute_rare_results(days: list[dict], params: list[RareMoveParams]) -> dict[RareMoveParams, tuple[pd.Series, pd.DataFrame]]:
+    out = {}
+    for idx, p in enumerate(params, 1):
+        if idx % 25 == 0:
+            print("precomputed rare", idx, "of", len(params), flush=True)
+        trades, daily, _ = backtest_rare_days(days, p, collect_trades=True)
         out[p] = (daily, trades)
     return out
 
@@ -632,6 +839,79 @@ def evaluate_stable_grid_cached(
     return add_stable_cluster_scores(evaluate_robust_grid_cached(cache, params, start, end))
 
 
+def evaluate_rare_grid_cached(
+    cache: dict[RareMoveParams, tuple[pd.Series, pd.DataFrame]],
+    params: list[RareMoveParams],
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame:
+    rows = []
+    for p in params:
+        daily, trades = cache[p]
+        period_daily = slice_daily(daily, start, end)
+        period_trades = slice_trades(trades, start, end)
+        metrics = compute_metrics(period_daily, period_trades)
+        concentration = concentration_metrics(period_daily, period_trades)
+        rows.append(
+            {
+                "params_obj": p,
+                "params": p.label,
+                "delay_s": p.delay_s,
+                "rarity_percentile": p.percentile,
+                "move_window_s": p.move_window_s,
+                "hold_s": p.hold_s,
+                "signal_mode": p.signal_mode,
+                "bad_hour_rule": p.bad_hour_rule,
+                "score": robust_score(metrics, concentration),
+                **metrics,
+                **concentration,
+            }
+        )
+    return add_rare_cluster_scores(pd.DataFrame(rows))
+
+
+def add_rare_cluster_scores(grid: pd.DataFrame) -> pd.DataFrame:
+    if grid.empty:
+        return grid
+    out = grid.copy()
+    positive = (
+        (out["total_pnl_cents"] > 0)
+        & (out["daily_sharpe"] > 0)
+        & (out["top_trade_removed_pnl_cents"] > 0)
+    )
+    delay_idx = out["delay_s"].map(lambda x: _index_distance(int(x), RARE_DELAYS))
+    percentile_idx = out["rarity_percentile"].map(lambda x: _index_distance(float(x), RARE_PERCENTILES))
+    lookback_idx = out["move_window_s"].map(lambda x: _index_distance(int(x), RARE_MOVE_WINDOWS))
+    hold_idx = out["hold_s"].map(lambda x: _index_distance(int(x), RARE_HOLDS))
+
+    cluster_counts = []
+    cluster_positive_counts = []
+    for idx, row in out.iterrows():
+        same_family = out["signal_mode"].eq(row["signal_mode"])
+        nearby = (
+            same_family
+            & ((delay_idx - delay_idx.loc[idx]).abs() <= 1)
+            & ((percentile_idx - percentile_idx.loc[idx]).abs() <= 1)
+            & ((lookback_idx - lookback_idx.loc[idx]).abs() <= 1)
+            & ((hold_idx - hold_idx.loc[idx]).abs() <= 1)
+        )
+        nearby.loc[idx] = False
+        cluster_count = int(nearby.sum())
+        cluster_positive_count = int((nearby & positive).sum())
+        cluster_counts.append(cluster_count)
+        cluster_positive_counts.append(cluster_positive_count)
+
+    out["cluster_neighbors"] = cluster_counts
+    out["cluster_positive_neighbors"] = cluster_positive_counts
+    out["cluster_positive_rate"] = np.where(
+        out["cluster_neighbors"] > 0,
+        out["cluster_positive_neighbors"] / out["cluster_neighbors"],
+        0.0,
+    )
+    out["rare_stability_score"] = out["score"] + 0.40 * out["cluster_positive_neighbors"] + 1.50 * out["cluster_positive_rate"]
+    return out.sort_values(["rare_stability_score", "cluster_positive_neighbors", "daily_sharpe"], ascending=False).reset_index(drop=True)
+
+
 def select_robust_candidate(grid: pd.DataFrame, strict: bool = False) -> pd.Series | None:
     eligible = grid[np.isfinite(grid["score"])].copy()
     if strict and not eligible.empty:
@@ -674,6 +954,29 @@ def select_stable_candidate(grid: pd.DataFrame) -> pd.Series | None:
         return None
     return eligible.sort_values(
         ["stable_score", "cluster_positive_neighbors", "top_trade_removed_pnl_cents", "daily_sharpe"],
+        ascending=False,
+    ).iloc[0]
+
+
+def select_rare_candidate(grid: pd.DataFrame) -> pd.Series | None:
+    if grid.empty:
+        return None
+    eligible = grid[
+        np.isfinite(grid["rare_stability_score"])
+        & (grid["month_count"] >= 2)
+        & (grid["trades"] >= MIN_TRAIN_TRADES)
+        & (grid["total_pnl_cents"] > 0)
+        & (grid["daily_sharpe"] > 0)
+        & (grid["top_trade_removed_pnl_cents"] > 0)
+        & (grid["cluster_positive_neighbors"] >= 2)
+        & (grid["profitable_month_rate"] >= 0.50)
+        & (grid["top_trade_share"] <= 0.45)
+        & (grid["best_month_share"] <= 0.55)
+    ].copy()
+    if eligible.empty:
+        return None
+    return eligible.sort_values(
+        ["rare_stability_score", "cluster_positive_neighbors", "top_trade_removed_pnl_cents", "daily_sharpe"],
         ascending=False,
     ).iloc[0]
 
@@ -1082,6 +1385,105 @@ def run_stable_walkforward_cached(
     return decisions_df, trades_df, daily_oos, rankings_df
 
 
+def run_rare_walkforward_cached(
+    cache: dict[RareMoveParams, tuple[pd.Series, pd.DataFrame]],
+    bars: pd.DataFrame,
+    params: list[RareMoveParams],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.DataFrame]:
+    run_key = "rare_move_percentile_wf"
+    run_label = "Rare move percentile walk-forward"
+    decisions = []
+    trades_list = []
+    daily_list = []
+    rankings = []
+
+    for train_start, train_end, test_start, test_end in period_schedule(bars, "monthly"):
+        grid = evaluate_rare_grid_cached(cache, params, train_start, train_end)
+        selected = select_rare_candidate(grid)
+        top = grid.drop(columns=["params_obj"]).head(50).copy()
+        top["run_key"] = run_key
+        top["run_label"] = run_label
+        top["objective"] = "rare_move_stability_score"
+        top["train_start"] = train_start.date().isoformat()
+        top["train_end"] = train_end.date().isoformat()
+        top["test_start"] = test_start.date().isoformat()
+        top["test_end"] = test_end.date().isoformat()
+        rankings.append(top)
+
+        if selected is None:
+            decisions.append(
+                {
+                    "run_key": run_key,
+                    "run_label": run_label,
+                    "objective": "rare_move_stability_score",
+                    "train_start": train_start.date().isoformat(),
+                    "train_end": train_end.date().isoformat(),
+                    "test_start": test_start.date().isoformat(),
+                    "test_end": test_end.date().isoformat(),
+                    "selected_params": "NO_STABLE_RARE_MOVE_CANDIDATE",
+                    "test_total_pnl_cents": 0.0,
+                    "test_sharpe": 0.0,
+                    "test_trades": 0,
+                }
+            )
+            continue
+
+        p: RareMoveParams = selected["params_obj"]
+        daily_full, trades_full = cache[p]
+        daily = slice_daily(daily_full, test_start, test_end)
+        trades = slice_trades(trades_full, test_start, test_end)
+        metrics = compute_metrics(daily, trades)
+        concentration = concentration_metrics(daily, trades)
+        daily_list.append(daily)
+        if not trades.empty:
+            out_trades = trades.copy()
+            out_trades["run_key"] = run_key
+            out_trades["run_label"] = run_label
+            out_trades["objective"] = "rare_move_stability_score"
+            out_trades["test_start"] = test_start.date().isoformat()
+            out_trades["test_end"] = test_end.date().isoformat()
+            out_trades["selected_params"] = p.label
+            trades_list.append(out_trades)
+
+        decisions.append(
+            {
+                "run_key": run_key,
+                "run_label": run_label,
+                "objective": "rare_move_stability_score",
+                "train_start": train_start.date().isoformat(),
+                "train_end": train_end.date().isoformat(),
+                "test_start": test_start.date().isoformat(),
+                "test_end": test_end.date().isoformat(),
+                "selected_params": p.label,
+                "train_rare_stability_score": float(selected["rare_stability_score"]),
+                "train_total_pnl_cents": float(selected["total_pnl_cents"]),
+                "train_sharpe": float(selected["daily_sharpe"]),
+                "train_trades": int(selected["trades"]),
+                "train_profitable_month_rate": float(selected["profitable_month_rate"]),
+                "train_top_trade_share": float(selected["top_trade_share"]),
+                "train_best_month_share": float(selected["best_month_share"]),
+                "train_top_trade_removed_pnl_cents": float(selected["top_trade_removed_pnl_cents"]),
+                "train_cluster_positive_neighbors": int(selected["cluster_positive_neighbors"]),
+                "train_cluster_positive_rate": float(selected["cluster_positive_rate"]),
+                "test_total_pnl_cents": metrics["total_pnl_cents"],
+                "test_sharpe": metrics["daily_sharpe"],
+                "test_trades": metrics["trades"],
+                "test_win_rate": metrics["win_rate"],
+                "test_max_drawdown_cents": metrics["max_drawdown_cents"],
+                "test_profitable_month_rate": concentration["profitable_month_rate"],
+                "test_top_trade_share": concentration["top_trade_share"],
+                "test_best_month_share": concentration["best_month_share"],
+                "test_top_trade_removed_pnl_cents": concentration["top_trade_removed_pnl_cents"],
+            }
+        )
+
+    daily_oos = pd.concat(daily_list).sort_index().groupby(level=0).sum() if daily_list else pd.Series(dtype=float, name="daily_pnl_cents")
+    trades_df = pd.concat(trades_list, ignore_index=True) if trades_list else pd.DataFrame()
+    decisions_df = pd.DataFrame(decisions)
+    rankings_df = pd.concat(rankings, ignore_index=True) if rankings else pd.DataFrame()
+    return decisions_df, trades_df, daily_oos, rankings_df
+
+
 def monthly_audit_rows(daily: pd.Series, trades: pd.DataFrame, run_key: str, run_label: str) -> list[dict]:
     if daily.empty:
         return []
@@ -1157,6 +1559,7 @@ def main() -> None:
     bars, stats = load_second_prices(DATA_DIR, "2025-10-01", "2026-03-26", cache_dir=BASE_DIR / ".price_cache", workers=8)
     bars = add_volatility_columns(bars)
     days = prepare_days(bars)
+    days = add_rare_move_thresholds(days)
     params = build_universe()
 
     pd.DataFrame([p.__dict__ | {"label": p.label} for p in params]).to_csv(OUT_DIR / "parameter_universe.csv", index=False)
@@ -1271,6 +1674,32 @@ def main() -> None:
     if not top_trades.empty:
         all_top_trades.append(top_trades)
 
+    rare_params = build_rare_universe()
+    pd.DataFrame([p.__dict__ | {"label": p.label} for p in rare_params]).to_csv(OUT_DIR / "rare_move_parameter_universe.csv", index=False)
+    print("precomputing rare move candidates", len(rare_params), flush=True)
+    rare_cache = precompute_rare_results(days, rare_params)
+    rare_decisions, rare_trades, rare_daily, rare_rankings = run_rare_walkforward_cached(rare_cache, bars, rare_params)
+    rare_metrics = compute_metrics(rare_daily, rare_trades)
+    rare_concentration = concentration_metrics(rare_daily, rare_trades)
+    rare_run_key = "rare_move_percentile_wf"
+    rare_run_label = "Rare move percentile walk-forward"
+    rare_metrics_df = pd.DataFrame(
+        [
+            {
+                "run_key": rare_run_key,
+                "run_label": rare_run_label,
+                "objective": "rare_move_stability_score",
+                **rare_metrics,
+                **rare_concentration,
+            }
+        ]
+    )
+    all_monthly_audit.extend(monthly_audit_rows(rare_daily, rare_trades, rare_run_key, rare_run_label))
+    all_repeated_clocks.extend(repeated_clock_rows(rare_trades, rare_run_key, rare_run_label))
+    top_trades = top_trade_rows(rare_trades, rare_run_key, rare_run_label)
+    if not top_trades.empty:
+        all_top_trades.append(top_trades)
+
     pd.DataFrame(all_metrics).sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False).to_csv(OUT_DIR / "metrics.csv", index=False)
     (pd.concat(all_decisions, ignore_index=True) if all_decisions else pd.DataFrame()).to_csv(OUT_DIR / "decisions.csv", index=False)
     (pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()).to_csv(OUT_DIR / "trades.csv", index=False)
@@ -1290,6 +1719,11 @@ def main() -> None:
     stable_trades.to_csv(OUT_DIR / "stable_4var_trades.csv", index=False)
     stable_daily.rename(stable_run_key).to_csv(OUT_DIR / "stable_4var_daily_pnl.csv")
     stable_rankings.to_csv(OUT_DIR / "stable_4var_train_rankings.csv", index=False)
+    rare_metrics_df.to_csv(OUT_DIR / "rare_move_metrics.csv", index=False)
+    rare_decisions.to_csv(OUT_DIR / "rare_move_decisions.csv", index=False)
+    rare_trades.to_csv(OUT_DIR / "rare_move_trades.csv", index=False)
+    rare_daily.rename(rare_run_key).to_csv(OUT_DIR / "rare_move_daily_pnl.csv")
+    rare_rankings.to_csv(OUT_DIR / "rare_move_train_rankings.csv", index=False)
     pd.DataFrame(all_monthly_audit).to_csv(OUT_DIR / "stability_monthly_audit.csv", index=False)
     pd.DataFrame(all_repeated_clocks).to_csv(OUT_DIR / "stability_repeated_clocks.csv", index=False)
     (pd.concat(all_top_trades, ignore_index=True) if all_top_trades else pd.DataFrame()).to_csv(OUT_DIR / "stability_top_trades.csv", index=False)
@@ -1301,6 +1735,7 @@ def main() -> None:
                 "raw_files": int(len(stats)),
                 "candidate_count": int(len(params)),
                 "stable_4var_candidate_count": int(len(stable_params)),
+                "rare_move_candidate_count": int(len(rare_params)),
                 "train_months": TRAIN_MONTHS,
                 "rebalance_options": "monthly",
                 "vol_methods": "percent_to_dollar",
@@ -1310,6 +1745,12 @@ def main() -> None:
                 "stable_4var_b_sigma_multiples": ",".join(f"{x:g}" for x in STABLE_SIGMA_MULTIPLES),
                 "stable_4var_c_move_windows_seconds": ",".join(str(x) for x in STABLE_MOVE_WINDOWS),
                 "stable_4var_d_hold_seconds": ",".join(str(x) for x in STABLE_HOLDS),
+                "rare_move_a_delay_seconds": ",".join(str(x) for x in RARE_DELAYS),
+                "rare_move_b_percentiles": ",".join(f"{x:g}" for x in RARE_PERCENTILES),
+                "rare_move_c_move_windows_seconds": ",".join(str(x) for x in RARE_MOVE_WINDOWS),
+                "rare_move_d_hold_seconds": ",".join(str(x) for x in RARE_HOLDS),
+                "rare_move_threshold_lookback_days": RARE_LOOKBACK_DAYS,
+                "rare_move_threshold_min_observations": RARE_MIN_OBSERVATIONS,
                 "walkforward_test_start": WALKFORWARD_START.date().isoformat(),
                 "early_rebalance_training": "Nov uses Oct only; Dec uses Oct-Nov; Jan onward uses rolling 3 months",
                 "vol_min_observations": VOL_MIN_OBSERVATIONS,

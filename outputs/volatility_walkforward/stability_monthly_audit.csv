@@ -28,3 +28,7 @@ robust_percent_reversal,Robust percent-vol: reversal only,2026-03-01,2003.608799
 stable_4var_percent,Stable 4-variable percent-vol walk-forward,2026-01-01,360.29720000000276,-0.2667421812765257,10
 stable_4var_percent,Stable 4-variable percent-vol walk-forward,2026-02-01,436.1572000000025,-0.3229043215086369,20
 stable_4var_percent,Stable 4-variable percent-vol walk-forward,2026-03-01,-2147.1864000000005,1.5896465027851627,19
+rare_move_percentile_wf,Rare move percentile walk-forward,2025-12-01,-133.93560000000255,-7.246969959312107,22
+rare_move_percentile_wf,Rare move percentile walk-forward,2026-01-01,-58.52839999999958,-3.166847026231947,15
+rare_move_percentile_wf,Rare move percentile walk-forward,2026-02-01,0.0,0.0,0
+rare_move_percentile_wf,Rare move percentile walk-forward,2026-03-01,210.94559999999944,11.413816985544058,19

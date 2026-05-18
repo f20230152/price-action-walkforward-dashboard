@@ -2,3 +2,4 @@ run_key,run_label,entry_clock,count,dates,total_pnl_cents,avg_pnl_cents
 percent_to_dollar_monthly_pnl_objective,Baseline pnl objective,11:32:00,2,"2025-12-11, 2026-03-10",562.8063999999997,281.40319999999986
 stable_4var_percent,Stable 4-variable percent-vol walk-forward,12:02:00,5,"2026-03-02, 2026-03-09, 2026-03-10, 2026-03-11, 2026-03-18",-3476.0087999999987,-695.2017599999997
 stable_4var_percent,Stable 4-variable percent-vol walk-forward,15:40:50,2,"2026-02-19, 2026-03-26",331.99000000000007,165.99500000000003
+rare_move_percentile_wf,Rare move percentile walk-forward,11:17:00,2,"2026-03-02, 2026-03-09",-1731.6295999999993,-865.8147999999997
