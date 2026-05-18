@@ -36,6 +36,13 @@ RARE_MOVE_WINDOWS = [300, 900, 1800, 3600]
 RARE_HOLDS = [3600, 7200, 14400, 21600]
 RARE_LOOKBACK_DAYS = 63
 RARE_MIN_OBSERVATIONS = 500
+REGIME_RARE_DELAYS = [120]
+REGIME_RARE_PERCENTILES = [95.0, 97.5, 99.0]
+REGIME_RARE_MOVE_WINDOWS = [900, 1800]
+REGIME_RARE_HOLDS = [3600, 7200]
+REGIME_TREND_FILTERS = ["any", "up", "down"]
+REGIME_VOL_FILTERS = ["any", "high"]
+REGIME_TIME_BUCKETS = ["any", "early", "mid", "late"]
 SESSION_START_HOUR_DUBAI = 11
 SESSION_END_HOUR_DUBAI = 24
 MAX_TRADES_PER_DAY = 1
@@ -79,6 +86,28 @@ class RareMoveParams:
         return (
             f"a={self.delay_s}s | move>{percentile_label} of recent {self.move_window_s}s moves | "
             f"hold={self.hold_s}s | {self.signal_mode} | {self.bad_hour_rule}"
+        )
+
+
+@dataclass(frozen=True)
+class RegimeRareMoveParams:
+    delay_s: int
+    percentile: float
+    move_window_s: int
+    hold_s: int
+    signal_mode: str
+    bad_hour_rule: str
+    trend_filter: str
+    vol_filter: str
+    time_bucket: str
+
+    @property
+    def label(self) -> str:
+        percentile_label = f"{self.percentile:g}th percentile"
+        return (
+            f"a={self.delay_s}s | move>{percentile_label} of recent {self.move_window_s}s moves | "
+            f"hold={self.hold_s}s | {self.signal_mode} | trend={self.trend_filter} | "
+            f"vol={self.vol_filter} | time={self.time_bucket} | {self.bad_hour_rule}"
         )
 
 
@@ -127,6 +156,32 @@ def build_rare_universe() -> list[RareMoveParams]:
     ]
 
 
+def build_regime_rare_universe() -> list[RegimeRareMoveParams]:
+    return [
+        RegimeRareMoveParams(
+            delay_s=delay,
+            percentile=percentile,
+            move_window_s=lookback,
+            hold_s=hold,
+            signal_mode=mode,
+            bad_hour_rule="exit_by_midnight",
+            trend_filter=trend_filter,
+            vol_filter=vol_filter,
+            time_bucket=time_bucket,
+        )
+        for delay, percentile, lookback, hold, mode, trend_filter, vol_filter, time_bucket in itertools.product(
+            REGIME_RARE_DELAYS,
+            REGIME_RARE_PERCENTILES,
+            REGIME_RARE_MOVE_WINDOWS,
+            REGIME_RARE_HOLDS,
+            ["continuation", "reversal"],
+            REGIME_TREND_FILTERS,
+            REGIME_VOL_FILTERS,
+            REGIME_TIME_BUCKETS,
+        )
+    ]
+
+
 def build_stable_universe() -> list[VolParams]:
     return [
         VolParams(
@@ -169,6 +224,11 @@ def add_volatility_columns(bars: pd.DataFrame) -> pd.DataFrame:
         pct_sigma_to_dollar = (pct_change.rolling(window, min_periods=VOL_MIN_OBSERVATIONS).std().shift(1) * daily_close.shift(1))
         vol_cols[f"sigma_dollar_{window}"] = dollar_sigma
         vol_cols[f"sigma_percent_to_dollar_{window}"] = pct_sigma_to_dollar
+        vol_cols[f"trend_5d_pct_{window}"] = daily_close.pct_change(5).shift(1)
+        vol_cols[f"vol_rank_{window}"] = pct_sigma_to_dollar.rolling(window, min_periods=VOL_MIN_OBSERVATIONS).apply(
+            lambda x: pd.Series(x).rank(pct=True).iloc[-1],
+            raw=False,
+        )
 
     date_index = out.index.normalize()
     for name, series in vol_cols.items():
@@ -193,6 +253,8 @@ def prepare_days(bars: pd.DataFrame) -> list[dict]:
                 ),
                 "sigma_dollar_63": _day_scalar(day_bars, "sigma_dollar_63"),
                 "sigma_percent_to_dollar_63": _day_scalar(day_bars, "sigma_percent_to_dollar_63"),
+                "trend_5d_pct_63": _day_scalar(day_bars, "trend_5d_pct_63"),
+                "vol_rank_63": _day_scalar(day_bars, "vol_rank_63"),
             }
         )
     return days
@@ -405,6 +467,7 @@ def scan_rare_day(day: dict, params: RareMoveParams, collect_trades: bool) -> tu
     if REQUIRE_FULL_SIGNAL_WINDOW_IN_SESSION:
         lookback_start_idx = raw_idx - params.move_window_s
         keep = keep & (dubai_seconds[lookback_start_idx] >= start_seconds)
+    keep = keep & regime_keep_mask(day, params, raw_idx)
     raw_idx = raw_idx[keep]
     if raw_idx.size == 0:
         return [], [], []
@@ -470,6 +533,11 @@ def scan_rare_day(day: dict, params: RareMoveParams, collect_trades: bool) -> tu
                     "net_pnl_cents": net_cents,
                     "bad_hour_rule": params.bad_hour_rule,
                     "signal_mode": params.signal_mode,
+                    "trend_filter": getattr(params, "trend_filter", "any"),
+                    "vol_filter": getattr(params, "vol_filter", "any"),
+                    "time_bucket": getattr(params, "time_bucket", "any"),
+                    "trend_5d_pct": day.get("trend_5d_pct_63", np.nan),
+                    "vol_rank": day.get("vol_rank_63", np.nan),
                     "params": params.label,
                 }
             )
@@ -477,6 +545,35 @@ def scan_rare_day(day: dict, params: RareMoveParams, collect_trades: bool) -> tu
         i = int(np.searchsorted(raw_idx, last_exit - params.delay_s + 1, side="left"))
 
     return trades, pnls, sides
+
+
+def regime_keep_mask(day: dict, params, raw_idx: np.ndarray) -> np.ndarray:
+    keep = np.ones(raw_idx.size, dtype=bool)
+
+    trend_filter = getattr(params, "trend_filter", "any")
+    trend = day.get("trend_5d_pct_63", np.nan)
+    if trend_filter == "up":
+        keep &= np.isfinite(trend) and trend > 0
+    elif trend_filter == "down":
+        keep &= np.isfinite(trend) and trend < 0
+
+    vol_filter = getattr(params, "vol_filter", "any")
+    vol_rank = day.get("vol_rank_63", np.nan)
+    if vol_filter == "high":
+        keep &= np.isfinite(vol_rank) and vol_rank >= 0.60
+    elif vol_filter == "low":
+        keep &= np.isfinite(vol_rank) and vol_rank <= 0.40
+
+    time_bucket = getattr(params, "time_bucket", "any")
+    if time_bucket != "any":
+        seconds = day["dubai_seconds"][raw_idx]
+        if time_bucket == "early":
+            keep &= (seconds >= 11 * 3600) & (seconds < 14 * 3600)
+        elif time_bucket == "mid":
+            keep &= (seconds >= 14 * 3600) & (seconds < 18 * 3600)
+        elif time_bucket == "late":
+            keep &= (seconds >= 18 * 3600) & (seconds < 24 * 3600)
+    return keep
 
 
 def apply_bad_hour_rule(times: np.ndarray, dubai_times: pd.DatetimeIndex, entry_idx: int, exit_idx: int, rule: str) -> int | None:
@@ -862,6 +959,9 @@ def evaluate_rare_grid_cached(
                 "hold_s": p.hold_s,
                 "signal_mode": p.signal_mode,
                 "bad_hour_rule": p.bad_hour_rule,
+                "trend_filter": getattr(p, "trend_filter", "any"),
+                "vol_filter": getattr(p, "vol_filter", "any"),
+                "time_bucket": getattr(p, "time_bucket", "any"),
                 "score": robust_score(metrics, concentration),
                 **metrics,
                 **concentration,
@@ -887,7 +987,12 @@ def add_rare_cluster_scores(grid: pd.DataFrame) -> pd.DataFrame:
     cluster_counts = []
     cluster_positive_counts = []
     for idx, row in out.iterrows():
-        same_family = out["signal_mode"].eq(row["signal_mode"])
+        same_family = (
+            out["signal_mode"].eq(row["signal_mode"])
+            & out["trend_filter"].eq(row["trend_filter"])
+            & out["vol_filter"].eq(row["vol_filter"])
+            & out["time_bucket"].eq(row["time_bucket"])
+        )
         nearby = (
             same_family
             & ((delay_idx - delay_idx.loc[idx]).abs() <= 1)
@@ -972,6 +1077,35 @@ def select_rare_candidate(grid: pd.DataFrame) -> pd.Series | None:
         & (grid["profitable_month_rate"] >= 0.50)
         & (grid["top_trade_share"] <= 0.45)
         & (grid["best_month_share"] <= 0.55)
+    ].copy()
+    if eligible.empty:
+        return None
+    return eligible.sort_values(
+        ["rare_stability_score", "cluster_positive_neighbors", "top_trade_removed_pnl_cents", "daily_sharpe"],
+        ascending=False,
+    ).iloc[0]
+
+
+def select_regime_rare_candidate(grid: pd.DataFrame) -> pd.Series | None:
+    if grid.empty:
+        return None
+    active_regime = (
+        grid["trend_filter"].ne("any")
+        | grid["vol_filter"].ne("any")
+        | grid["time_bucket"].ne("any")
+    )
+    eligible = grid[
+        active_regime
+        & np.isfinite(grid["rare_stability_score"])
+        & (grid["month_count"] >= 2)
+        & (grid["trades"] >= 10)
+        & (grid["total_pnl_cents"] > 0)
+        & (grid["daily_sharpe"] > 0)
+        & (grid["top_trade_removed_pnl_cents"] > 0)
+        & (grid["cluster_positive_neighbors"] >= 2)
+        & (grid["profitable_month_rate"] >= 0.50)
+        & (grid["top_trade_share"] <= 0.35)
+        & (grid["best_month_share"] <= 0.50)
     ].copy()
     if eligible.empty:
         return None
@@ -1484,6 +1618,105 @@ def run_rare_walkforward_cached(
     return decisions_df, trades_df, daily_oos, rankings_df
 
 
+def run_regime_rare_walkforward_cached(
+    cache: dict[RegimeRareMoveParams, tuple[pd.Series, pd.DataFrame]],
+    bars: pd.DataFrame,
+    params: list[RegimeRareMoveParams],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.DataFrame]:
+    run_key = "regime_rare_move_wf"
+    run_label = "Regime-gated rare move walk-forward"
+    decisions = []
+    trades_list = []
+    daily_list = []
+    rankings = []
+
+    for train_start, train_end, test_start, test_end in period_schedule(bars, "monthly"):
+        grid = evaluate_rare_grid_cached(cache, params, train_start, train_end)
+        selected = select_regime_rare_candidate(grid)
+        top = grid.drop(columns=["params_obj"]).head(50).copy()
+        top["run_key"] = run_key
+        top["run_label"] = run_label
+        top["objective"] = "regime_rare_move_stability_score"
+        top["train_start"] = train_start.date().isoformat()
+        top["train_end"] = train_end.date().isoformat()
+        top["test_start"] = test_start.date().isoformat()
+        top["test_end"] = test_end.date().isoformat()
+        rankings.append(top)
+
+        if selected is None:
+            decisions.append(
+                {
+                    "run_key": run_key,
+                    "run_label": run_label,
+                    "objective": "regime_rare_move_stability_score",
+                    "train_start": train_start.date().isoformat(),
+                    "train_end": train_end.date().isoformat(),
+                    "test_start": test_start.date().isoformat(),
+                    "test_end": test_end.date().isoformat(),
+                    "selected_params": "NO_STABLE_REGIME_RARE_MOVE_CANDIDATE",
+                    "test_total_pnl_cents": 0.0,
+                    "test_sharpe": 0.0,
+                    "test_trades": 0,
+                }
+            )
+            continue
+
+        p: RegimeRareMoveParams = selected["params_obj"]
+        daily_full, trades_full = cache[p]
+        daily = slice_daily(daily_full, test_start, test_end)
+        trades = slice_trades(trades_full, test_start, test_end)
+        metrics = compute_metrics(daily, trades)
+        concentration = concentration_metrics(daily, trades)
+        daily_list.append(daily)
+        if not trades.empty:
+            out_trades = trades.copy()
+            out_trades["run_key"] = run_key
+            out_trades["run_label"] = run_label
+            out_trades["objective"] = "regime_rare_move_stability_score"
+            out_trades["test_start"] = test_start.date().isoformat()
+            out_trades["test_end"] = test_end.date().isoformat()
+            out_trades["selected_params"] = p.label
+            trades_list.append(out_trades)
+
+        decisions.append(
+            {
+                "run_key": run_key,
+                "run_label": run_label,
+                "objective": "regime_rare_move_stability_score",
+                "train_start": train_start.date().isoformat(),
+                "train_end": train_end.date().isoformat(),
+                "test_start": test_start.date().isoformat(),
+                "test_end": test_end.date().isoformat(),
+                "selected_params": p.label,
+                "train_rare_stability_score": float(selected["rare_stability_score"]),
+                "train_total_pnl_cents": float(selected["total_pnl_cents"]),
+                "train_sharpe": float(selected["daily_sharpe"]),
+                "train_trades": int(selected["trades"]),
+                "train_profitable_month_rate": float(selected["profitable_month_rate"]),
+                "train_top_trade_share": float(selected["top_trade_share"]),
+                "train_best_month_share": float(selected["best_month_share"]),
+                "train_top_trade_removed_pnl_cents": float(selected["top_trade_removed_pnl_cents"]),
+                "train_cluster_positive_neighbors": int(selected["cluster_positive_neighbors"]),
+                "train_cluster_positive_rate": float(selected["cluster_positive_rate"]),
+                "test_total_pnl_cents": metrics["total_pnl_cents"],
+                "test_sharpe": metrics["daily_sharpe"],
+                "test_trades": metrics["trades"],
+                "test_win_rate": metrics["win_rate"],
+                "test_max_drawdown_cents": metrics["max_drawdown_cents"],
+                "test_profitable_month_rate": concentration["profitable_month_rate"],
+                "test_top_trade_share": concentration["top_trade_share"],
+                "test_best_month_share": concentration["best_month_share"],
+                "test_top_trade_removed_pnl_cents": concentration["top_trade_removed_pnl_cents"],
+            }
+        )
+
+    daily_oos = pd.concat(daily_list).sort_index().groupby(level=0).sum() if daily_list else pd.Series(dtype=float, name="daily_pnl_cents")
+    trades_df = pd.concat(trades_list, ignore_index=True) if trades_list else pd.DataFrame()
+    decisions_df = pd.DataFrame(decisions)
+    rankings_df = pd.concat(rankings, ignore_index=True) if rankings else pd.DataFrame()
+    return decisions_df, trades_df, daily_oos.rename(run_key), rankings_df
+
+
 def monthly_audit_rows(daily: pd.Series, trades: pd.DataFrame, run_key: str, run_label: str) -> list[dict]:
     if daily.empty:
         return []
@@ -1700,6 +1933,36 @@ def main() -> None:
     if not top_trades.empty:
         all_top_trades.append(top_trades)
 
+    regime_rare_params = build_regime_rare_universe()
+    pd.DataFrame([p.__dict__ | {"label": p.label} for p in regime_rare_params]).to_csv(OUT_DIR / "regime_rare_parameter_universe.csv", index=False)
+    print("precomputing regime-gated rare move candidates", len(regime_rare_params), flush=True)
+    regime_rare_cache = precompute_rare_results(days, regime_rare_params)
+    regime_rare_decisions, regime_rare_trades, regime_rare_daily, regime_rare_rankings = run_regime_rare_walkforward_cached(
+        regime_rare_cache,
+        bars,
+        regime_rare_params,
+    )
+    regime_rare_metrics = compute_metrics(regime_rare_daily, regime_rare_trades)
+    regime_rare_concentration = concentration_metrics(regime_rare_daily, regime_rare_trades)
+    regime_rare_run_key = "regime_rare_move_wf"
+    regime_rare_run_label = "Regime-gated rare move walk-forward"
+    regime_rare_metrics_df = pd.DataFrame(
+        [
+            {
+                "run_key": regime_rare_run_key,
+                "run_label": regime_rare_run_label,
+                "objective": "regime_rare_move_stability_score",
+                **regime_rare_metrics,
+                **regime_rare_concentration,
+            }
+        ]
+    )
+    all_monthly_audit.extend(monthly_audit_rows(regime_rare_daily, regime_rare_trades, regime_rare_run_key, regime_rare_run_label))
+    all_repeated_clocks.extend(repeated_clock_rows(regime_rare_trades, regime_rare_run_key, regime_rare_run_label))
+    top_trades = top_trade_rows(regime_rare_trades, regime_rare_run_key, regime_rare_run_label)
+    if not top_trades.empty:
+        all_top_trades.append(top_trades)
+
     pd.DataFrame(all_metrics).sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False).to_csv(OUT_DIR / "metrics.csv", index=False)
     (pd.concat(all_decisions, ignore_index=True) if all_decisions else pd.DataFrame()).to_csv(OUT_DIR / "decisions.csv", index=False)
     (pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()).to_csv(OUT_DIR / "trades.csv", index=False)
@@ -1724,6 +1987,11 @@ def main() -> None:
     rare_trades.to_csv(OUT_DIR / "rare_move_trades.csv", index=False)
     rare_daily.rename(rare_run_key).to_csv(OUT_DIR / "rare_move_daily_pnl.csv")
     rare_rankings.to_csv(OUT_DIR / "rare_move_train_rankings.csv", index=False)
+    regime_rare_metrics_df.to_csv(OUT_DIR / "regime_rare_metrics.csv", index=False)
+    regime_rare_decisions.to_csv(OUT_DIR / "regime_rare_decisions.csv", index=False)
+    regime_rare_trades.to_csv(OUT_DIR / "regime_rare_trades.csv", index=False)
+    regime_rare_daily.to_csv(OUT_DIR / "regime_rare_daily_pnl.csv")
+    regime_rare_rankings.to_csv(OUT_DIR / "regime_rare_train_rankings.csv", index=False)
     pd.DataFrame(all_monthly_audit).to_csv(OUT_DIR / "stability_monthly_audit.csv", index=False)
     pd.DataFrame(all_repeated_clocks).to_csv(OUT_DIR / "stability_repeated_clocks.csv", index=False)
     (pd.concat(all_top_trades, ignore_index=True) if all_top_trades else pd.DataFrame()).to_csv(OUT_DIR / "stability_top_trades.csv", index=False)
@@ -1736,6 +2004,7 @@ def main() -> None:
                 "candidate_count": int(len(params)),
                 "stable_4var_candidate_count": int(len(stable_params)),
                 "rare_move_candidate_count": int(len(rare_params)),
+                "regime_rare_move_candidate_count": int(len(regime_rare_params)),
                 "train_months": TRAIN_MONTHS,
                 "rebalance_options": "monthly",
                 "vol_methods": "percent_to_dollar",
@@ -1751,6 +2020,9 @@ def main() -> None:
                 "rare_move_d_hold_seconds": ",".join(str(x) for x in RARE_HOLDS),
                 "rare_move_threshold_lookback_days": RARE_LOOKBACK_DAYS,
                 "rare_move_threshold_min_observations": RARE_MIN_OBSERVATIONS,
+                "regime_rare_trend_filters": ",".join(REGIME_TREND_FILTERS),
+                "regime_rare_vol_filters": ",".join(REGIME_VOL_FILTERS),
+                "regime_rare_time_buckets": ",".join(REGIME_TIME_BUCKETS),
                 "walkforward_test_start": WALKFORWARD_START.date().isoformat(),
                 "early_rebalance_training": "Nov uses Oct only; Dec uses Oct-Nov; Jan onward uses rolling 3 months",
                 "vol_min_observations": VOL_MIN_OBSERVATIONS,

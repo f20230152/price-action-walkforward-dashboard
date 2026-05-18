@@ -167,6 +167,12 @@ def load_vol_outputs() -> dict[str, pd.DataFrame]:
         "rare_move_daily": "rare_move_daily_pnl.csv",
         "rare_move_rankings": "rare_move_train_rankings.csv",
         "rare_move_universe": "rare_move_parameter_universe.csv",
+        "regime_rare_metrics": "regime_rare_metrics.csv",
+        "regime_rare_decisions": "regime_rare_decisions.csv",
+        "regime_rare_trades": "regime_rare_trades.csv",
+        "regime_rare_daily": "regime_rare_daily_pnl.csv",
+        "regime_rare_rankings": "regime_rare_train_rankings.csv",
+        "regime_rare_universe": "regime_rare_parameter_universe.csv",
     }
     out = {}
     for key, name in files.items():
@@ -1135,6 +1141,158 @@ def render_rare_move_tab(vol_data: dict[str, pd.DataFrame]) -> None:
         st.dataframe(display_table(rankings), use_container_width=True, hide_index=True)
 
 
+def render_regime_rare_tab(vol_data: dict[str, pd.DataFrame]) -> None:
+    st.caption(
+        "Purpose: test whether the rare-move signal only works in specific market conditions. This is the same rare-spike logic, but trades are allowed only when the selected regime filter is active."
+    )
+    st.info(
+        "Simple: before taking a rare-move trade, the strategy asks: is the recent trend up/down, is volatility high, and what Dubai time bucket is this? "
+        "Technical: the walk-forward optimizer selects a, b, c, d, direction, 5-day trend filter, rolling-volatility-rank filter, and signal-time bucket using only prior data."
+    )
+
+    metrics = vol_data["regime_rare_metrics"]
+    decisions = vol_data["regime_rare_decisions"]
+    trades = vol_data["regime_rare_trades"]
+    daily = vol_data["regime_rare_daily"]
+    rankings = vol_data["regime_rare_rankings"]
+    universe = vol_data["regime_rare_universe"]
+
+    if metrics.empty:
+        st.warning("Regime-gated rare move outputs are missing. Run `python volatility_walkforward_research.py` first.")
+        return
+
+    st.subheader("What The Extra Regime Filters Mean")
+    regime_rows = pd.DataFrame(
+        [
+            {
+                "filter": "trend filter",
+                "simple_explanation": "Only trade when the last 5 sessions were up, down, or either.",
+                "technical_explanation": "`up` means prior 5-session close-to-close return > 0. `down` means < 0. The current test day is not used in this calculation.",
+            },
+            {
+                "filter": "volatility filter",
+                "simple_explanation": "Only trade when recent volatility is high, or allow any volatility.",
+                "technical_explanation": "`high` means the rolling 63-session percent-to-dollar volatility rank is at least 60%.",
+            },
+            {
+                "filter": "time bucket",
+                "simple_explanation": "Only trade rare moves in a selected Dubai-time part of the day.",
+                "technical_explanation": "`early` = 11:00-14:00, `mid` = 14:00-18:00, `late` = 18:00-24:00 Dubai signal time.",
+            },
+        ]
+    )
+    st.dataframe(regime_rows, use_container_width=True, hide_index=True)
+
+    row = metrics.iloc[0]
+    st.subheader("Regime-Gated Rare Move Walk-Forward Result")
+    metric_tiles(row)
+    if float(row.get("total_pnl_cents", 0.0)) <= 0 or float(row.get("top_trade_removed_pnl_cents", 0.0)) <= 0:
+        st.error(
+            "Conclusion: the regime gate did not yet create a robust tradeable strategy. "
+            "Simple: choosing trend, volatility, and time filters was not enough to make the curve consistently grow. "
+            "Technical: OOS PnL or top-trade-removed OOS PnL is non-positive, so the apparent edge is still not stable."
+        )
+    else:
+        st.success(
+            "Conclusion: this passed the first OOS stability check. Next inspect month concentration, top-trade dependence, and whether the selected regimes make economic sense."
+        )
+
+    metric_cols = [
+        "run_label",
+        "total_pnl_cents",
+        "daily_sharpe",
+        "max_drawdown_cents",
+        "trades",
+        "win_rate",
+        "profit_factor",
+        "profitable_month_rate",
+        "top_trade_share",
+        "best_month_share",
+        "top_trade_removed_pnl_cents",
+    ]
+    st.dataframe(display_table(metrics[[c for c in metric_cols if c in metrics.columns]]), use_container_width=True, hide_index=True)
+
+    st.subheader("Monthly Walk-Forward Decisions")
+    st.caption(
+        "Simple: each row shows the market regime and rare-move parameter selected before that OOS month. "
+        "Technical: train columns are in-sample diagnostics; test columns are next-month OOS results."
+    )
+    decision_cols = [
+        "test_start",
+        "test_end",
+        "selected_params",
+        "train_rare_stability_score",
+        "train_total_pnl_cents",
+        "train_sharpe",
+        "train_top_trade_removed_pnl_cents",
+        "train_top_trade_share",
+        "train_best_month_share",
+        "train_cluster_positive_neighbors",
+        "train_cluster_positive_rate",
+        "test_total_pnl_cents",
+        "test_sharpe",
+        "test_trades",
+        "test_top_trade_removed_pnl_cents",
+        "test_top_trade_share",
+    ]
+    st.dataframe(display_table(decisions[[c for c in decision_cols if c in decisions.columns]]), use_container_width=True, hide_index=True)
+
+    if not daily.empty:
+        date_col = daily.columns[0]
+        pnl_col = "regime_rare_move_wf" if "regime_rare_move_wf" in daily.columns else daily.columns[-1]
+        curve = daily[[date_col, pnl_col]].copy()
+        curve[date_col] = pd.to_datetime(curve[date_col])
+        curve["equity_cents"] = curve[pnl_col].fillna(0).cumsum()
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=curve[date_col], y=curve["equity_cents"], mode="lines", name="Regime-gated rare move OOS equity"))
+        fig.update_layout(
+            title="OOS Equity Curve: Regime-Gated Rare Move Strategy",
+            xaxis_title="Date",
+            yaxis_title="Cumulative out-of-sample PnL in cents",
+            height=390,
+            margin=dict(l=10, r=10, t=45, b=10),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(
+            "Simple: this should rise smoothly if the regime gate is helping. Technical: cumulative daily OOS PnL from monthly walk-forward test periods only."
+        )
+
+    st.subheader("Trades Taken")
+    st.caption(
+        "`trend_5d_pct`, `vol_rank`, and `time_bucket` explain why the selected regime allowed that trade. `threshold_cents` is the rolling rare-move threshold."
+    )
+    if trades.empty:
+        st.info("No trades were taken because no stable regime-gated rare-move candidate passed the filters.")
+    else:
+        display_cols = [
+            "test_start",
+            "signal_time_dubai",
+            "entry_time_dubai",
+            "exit_time_dubai",
+            "side",
+            "move_cents",
+            "threshold_cents",
+            "rarity_percentile",
+            "trend_filter",
+            "vol_filter",
+            "time_bucket",
+            "trend_5d_pct",
+            "vol_rank",
+            "entry_price",
+            "exit_price",
+            "net_pnl_cents",
+            "selected_params",
+        ]
+        st.dataframe(display_table(trades[[c for c in display_cols if c in trades.columns]]), use_container_width=True, hide_index=True)
+
+    with st.expander("Regime-Gated Rare Move Universe And Training Rankings"):
+        st.caption(
+            "Universe = every rare-move plus regime-filter candidate. Rankings = top training candidates before each OOS month."
+        )
+        st.dataframe(display_table(universe), use_container_width=True, hide_index=True)
+        st.dataframe(display_table(rankings), use_container_width=True, hide_index=True)
+
+
 def render_stability_audit_tab(vol_data: dict[str, pd.DataFrame]) -> None:
     st.caption(
         "This tab is for distrust. It shows whether PnL is coming from one month, one trade, or repeated clock-time artifacts."
@@ -1554,11 +1712,12 @@ def main() -> None:
     data = load_outputs()
     vol_data = load_vol_outputs()
 
-    baseline_tab, stable_4var_tab, rare_move_tab, robust_tab, fixed_diagnostic_tab, audit_tab = st.tabs(
+    baseline_tab, stable_4var_tab, rare_move_tab, regime_rare_tab, robust_tab, fixed_diagnostic_tab, audit_tab = st.tabs(
         [
             "Baseline Percent-Vol WF",
             "Stable 4-Variable WF",
             "Rare Move WF",
+            "Regime-Gated Rare WF",
             "Robust Percent-Vol WF",
             "Fixed Winner Diagnostic",
             "Stability Audit",
@@ -1570,6 +1729,8 @@ def main() -> None:
         render_stable_4var_tab(vol_data)
     with rare_move_tab:
         render_rare_move_tab(vol_data)
+    with regime_rare_tab:
+        render_regime_rare_tab(vol_data)
     with robust_tab:
         render_robust_walkforward_tab(vol_data)
     with fixed_diagnostic_tab:

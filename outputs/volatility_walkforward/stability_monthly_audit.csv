@@ -32,3 +32,6 @@ rare_move_percentile_wf,Rare move percentile walk-forward,2025-12-01,-133.935600
 rare_move_percentile_wf,Rare move percentile walk-forward,2026-01-01,-58.52839999999958,-3.166847026231947,15
 rare_move_percentile_wf,Rare move percentile walk-forward,2026-02-01,0.0,0.0,0
 rare_move_percentile_wf,Rare move percentile walk-forward,2026-03-01,210.94559999999944,11.413816985544058,19
+regime_rare_move_wf,Regime-gated rare move walk-forward,2026-01-01,33.57319999999939,-0.04467239639440106,5
+regime_rare_move_wf,Regime-gated rare move walk-forward,2026-02-01,0.0,-0.0,0
+regime_rare_move_wf,Regime-gated rare move walk-forward,2026-03-01,-785.1155999999964,1.0446723963944011,14
