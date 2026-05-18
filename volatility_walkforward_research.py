@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
@@ -29,6 +30,8 @@ SESSION_START_HOUR_DUBAI = 11
 SESSION_END_HOUR_DUBAI = 24
 MAX_TRADES_PER_DAY = 1
 MIN_TRAIN_TRADES = 5
+REQUIRE_FULL_SIGNAL_WINDOW_IN_SESSION = True
+ROBUST_OBJECTIVE_NAME = "robust_stability_score"
 
 
 @dataclass(frozen=True)
@@ -69,7 +72,7 @@ def build_universe() -> list[VolParams]:
             [1800],
             [3600, 21600],
             VOL_WINDOWS_DAYS,
-            ["dollar", "percent_to_dollar"],
+            ["percent_to_dollar"],
             ["continuation", "reversal"],
             ["exit_by_midnight"],
         )
@@ -175,6 +178,9 @@ def scan_day(day: dict, params: VolParams, sigma_col: str, collect_trades: bool)
 
     start_seconds = SESSION_START_HOUR_DUBAI * 3600
     keep = (dubai_seconds[raw_idx] >= start_seconds) & (dubai_seconds[raw_idx] < 24 * 3600)
+    if REQUIRE_FULL_SIGNAL_WINDOW_IN_SESSION:
+        lookback_start_idx = raw_idx - params.move_window_s
+        keep = keep & (dubai_seconds[lookback_start_idx] >= start_seconds)
     raw_idx = raw_idx[keep]
     if raw_idx.size == 0:
         return [], [], []
@@ -461,6 +467,105 @@ def evaluate_multiple_backtests_cached(
     return pd.DataFrame(rows).sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False).reset_index(drop=True)
 
 
+def concentration_metrics(daily: pd.Series, trades: pd.DataFrame) -> dict:
+    total_pnl = float(daily.sum()) if not daily.empty else 0.0
+    monthly = daily.groupby(pd.Grouper(freq="MS")).sum() if not daily.empty else pd.Series(dtype=float)
+    positive_months = monthly[monthly > 0]
+    best_month_pnl = float(positive_months.max()) if not positive_months.empty else 0.0
+    profitable_months = int((monthly > 0).sum()) if not monthly.empty else 0
+    month_count = int(monthly.shape[0])
+
+    top_trade_pnl = 0.0
+    top_trade_removed_pnl = total_pnl
+    if trades is not None and not trades.empty and "net_pnl_cents" in trades.columns:
+        positive_trades = trades[trades["net_pnl_cents"] > 0]["net_pnl_cents"]
+        if not positive_trades.empty:
+            top_trade_pnl = float(positive_trades.max())
+            top_trade_removed_pnl = total_pnl - top_trade_pnl
+
+    denominator = abs(total_pnl) if abs(total_pnl) > 1e-12 else 1.0
+    return {
+        "profitable_months": profitable_months,
+        "month_count": month_count,
+        "profitable_month_rate": float(profitable_months / month_count) if month_count else 0.0,
+        "best_month_pnl_cents": best_month_pnl,
+        "best_month_share": float(best_month_pnl / denominator),
+        "top_trade_pnl_cents": top_trade_pnl,
+        "top_trade_share": float(top_trade_pnl / denominator),
+        "top_trade_removed_pnl_cents": top_trade_removed_pnl,
+    }
+
+
+def robust_score(metrics: dict, concentration: dict) -> float:
+    if (
+        metrics["trades"] < MIN_TRAIN_TRADES
+        or metrics["total_pnl_cents"] <= 0
+        or metrics["daily_sharpe"] <= 0
+        or not np.isfinite(metrics["profit_factor"])
+    ):
+        return -np.inf
+
+    return float(
+        metrics["daily_sharpe"]
+        + 0.002 * concentration["top_trade_removed_pnl_cents"]
+        + 0.75 * concentration["profitable_month_rate"]
+        - 0.50 * max(concentration["top_trade_share"] - 0.35, 0.0)
+        - 0.50 * max(concentration["best_month_share"] - 0.60, 0.0)
+        + 0.001 * metrics["max_drawdown_cents"]
+    )
+
+
+def evaluate_robust_grid_cached(
+    cache: dict[VolParams, tuple[pd.Series, pd.DataFrame]],
+    params: list[VolParams],
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame:
+    rows = []
+    for p in params:
+        daily, trades = cache[p]
+        period_daily = slice_daily(daily, start, end)
+        period_trades = slice_trades(trades, start, end)
+        metrics = compute_metrics(period_daily, period_trades)
+        concentration = concentration_metrics(period_daily, period_trades)
+        rows.append(
+            {
+                "params_obj": p,
+                "params": p.label,
+                "delay_s": p.delay_s,
+                "sigma_multiple": p.sigma_multiple,
+                "move_window_s": p.move_window_s,
+                "hold_s": p.hold_s,
+                "vol_window_days": p.vol_window_days,
+                "vol_method": p.vol_method,
+                "signal_mode": p.signal_mode,
+                "bad_hour_rule": p.bad_hour_rule,
+                "score": robust_score(metrics, concentration),
+                **metrics,
+                **concentration,
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["score", "daily_sharpe", "total_pnl_cents"], ascending=False).reset_index(drop=True)
+
+
+def select_robust_candidate(grid: pd.DataFrame, strict: bool = False) -> pd.Series | None:
+    eligible = grid[np.isfinite(grid["score"])].copy()
+    if strict and not eligible.empty:
+        enough_history = eligible["month_count"] >= 2
+        eligible = eligible[
+            (~enough_history)
+            | (
+                (eligible["profitable_month_rate"] >= 0.67)
+                & (eligible["top_trade_removed_pnl_cents"] > 0)
+                & (eligible["top_trade_share"] <= 0.50)
+                & (eligible["best_month_share"] <= 0.70)
+            )
+        ].copy()
+    if eligible.empty:
+        return None
+    return eligible.sort_values(["score", "daily_sharpe", "top_trade_removed_pnl_cents"], ascending=False).iloc[0]
+
+
 def export_winning_percent_vol_backtest(
     cache: dict[VolParams, tuple[pd.Series, pd.DataFrame]],
     multiple_backtests: pd.DataFrame,
@@ -668,6 +773,175 @@ def run_walkforward_cached(
     return decisions_df, trades_df, daily_oos, rankings_df
 
 
+def run_robust_walkforward_cached(
+    cache: dict[VolParams, tuple[pd.Series, pd.DataFrame]],
+    bars: pd.DataFrame,
+    params: list[VolParams],
+    run_key: str,
+    run_label: str,
+    strict: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.DataFrame]:
+    decisions = []
+    trades_list = []
+    daily_list = []
+    rankings = []
+
+    for train_start, train_end, test_start, test_end in period_schedule(bars, "monthly"):
+        grid = evaluate_robust_grid_cached(cache, params, train_start, train_end)
+        selected = select_robust_candidate(grid, strict=strict)
+        top = grid.drop(columns=["params_obj"]).head(25).copy()
+        top["run_key"] = run_key
+        top["run_label"] = run_label
+        top["objective"] = ROBUST_OBJECTIVE_NAME
+        top["train_start"] = train_start.date().isoformat()
+        top["train_end"] = train_end.date().isoformat()
+        top["test_start"] = test_start.date().isoformat()
+        top["test_end"] = test_end.date().isoformat()
+        rankings.append(top)
+
+        if selected is None:
+            decisions.append(
+                {
+                    "run_key": run_key,
+                    "run_label": run_label,
+                    "objective": ROBUST_OBJECTIVE_NAME,
+                    "train_start": train_start.date().isoformat(),
+                    "train_end": train_end.date().isoformat(),
+                    "test_start": test_start.date().isoformat(),
+                    "test_end": test_end.date().isoformat(),
+                    "selected_params": "NO_ELIGIBLE_CANDIDATE",
+                    "test_total_pnl_cents": 0.0,
+                    "test_sharpe": 0.0,
+                    "test_trades": 0,
+                }
+            )
+            continue
+
+        p: VolParams = selected["params_obj"]
+        daily_full, trades_full = cache[p]
+        daily = slice_daily(daily_full, test_start, test_end)
+        trades = slice_trades(trades_full, test_start, test_end)
+        metrics = compute_metrics(daily, trades)
+        concentration = concentration_metrics(daily, trades)
+        daily_list.append(daily)
+        if not trades.empty:
+            out_trades = trades.copy()
+            out_trades["run_key"] = run_key
+            out_trades["run_label"] = run_label
+            out_trades["objective"] = ROBUST_OBJECTIVE_NAME
+            out_trades["test_start"] = test_start.date().isoformat()
+            out_trades["test_end"] = test_end.date().isoformat()
+            out_trades["selected_params"] = p.label
+            trades_list.append(out_trades)
+
+        decisions.append(
+            {
+                "run_key": run_key,
+                "run_label": run_label,
+                "objective": ROBUST_OBJECTIVE_NAME,
+                "train_start": train_start.date().isoformat(),
+                "train_end": train_end.date().isoformat(),
+                "test_start": test_start.date().isoformat(),
+                "test_end": test_end.date().isoformat(),
+                "selected_params": p.label,
+                "train_score": float(selected["score"]),
+                "train_total_pnl_cents": float(selected["total_pnl_cents"]),
+                "train_sharpe": float(selected["daily_sharpe"]),
+                "train_trades": int(selected["trades"]),
+                "train_profitable_month_rate": float(selected["profitable_month_rate"]),
+                "train_top_trade_share": float(selected["top_trade_share"]),
+                "train_best_month_share": float(selected["best_month_share"]),
+                "train_top_trade_removed_pnl_cents": float(selected["top_trade_removed_pnl_cents"]),
+                "test_total_pnl_cents": metrics["total_pnl_cents"],
+                "test_sharpe": metrics["daily_sharpe"],
+                "test_trades": metrics["trades"],
+                "test_win_rate": metrics["win_rate"],
+                "test_max_drawdown_cents": metrics["max_drawdown_cents"],
+                "test_profitable_month_rate": concentration["profitable_month_rate"],
+                "test_top_trade_share": concentration["top_trade_share"],
+                "test_best_month_share": concentration["best_month_share"],
+                "test_top_trade_removed_pnl_cents": concentration["top_trade_removed_pnl_cents"],
+            }
+        )
+
+    daily_oos = pd.concat(daily_list).sort_index().groupby(level=0).sum() if daily_list else pd.Series(dtype=float, name="daily_pnl_cents")
+    trades_df = pd.concat(trades_list, ignore_index=True) if trades_list else pd.DataFrame()
+    decisions_df = pd.DataFrame(decisions)
+    rankings_df = pd.concat(rankings, ignore_index=True) if rankings else pd.DataFrame()
+    return decisions_df, trades_df, daily_oos, rankings_df
+
+
+def monthly_audit_rows(daily: pd.Series, trades: pd.DataFrame, run_key: str, run_label: str) -> list[dict]:
+    if daily.empty:
+        return []
+    trade_months = pd.Series(dtype=int)
+    if trades is not None and not trades.empty and "entry_time_dubai" in trades.columns:
+        entry = pd.to_datetime(trades["entry_time_dubai"])
+        trade_months = entry.dt.to_period("M").dt.to_timestamp().value_counts()
+    total = float(daily.sum())
+    rows = []
+    for month, pnl in daily.groupby(pd.Grouper(freq="MS")).sum().items():
+        rows.append(
+            {
+                "run_key": run_key,
+                "run_label": run_label,
+                "month": month.date().isoformat(),
+                "month_pnl_cents": float(pnl),
+                "month_share_of_total": float(pnl / total) if abs(total) > 1e-12 else 0.0,
+                "trades": int(trade_months.get(month, 0)) if not trade_months.empty else 0,
+            }
+        )
+    return rows
+
+
+def repeated_clock_rows(trades: pd.DataFrame, run_key: str, run_label: str) -> list[dict]:
+    if trades is None or trades.empty or "entry_time_dubai" not in trades.columns:
+        return []
+    out = trades.copy()
+    entry = pd.to_datetime(out["entry_time_dubai"])
+    out["entry_clock"] = entry.dt.strftime("%H:%M:%S")
+    out["entry_date"] = entry.dt.date.astype(str)
+    grouped = out.groupby("entry_clock")
+    rows = []
+    for clock, group in grouped:
+        if len(group) < 2:
+            continue
+        rows.append(
+            {
+                "run_key": run_key,
+                "run_label": run_label,
+                "entry_clock": clock,
+                "count": int(len(group)),
+                "dates": ", ".join(group["entry_date"].tolist()),
+                "total_pnl_cents": float(group["net_pnl_cents"].sum()),
+                "avg_pnl_cents": float(group["net_pnl_cents"].mean()),
+            }
+        )
+    return rows
+
+
+def top_trade_rows(trades: pd.DataFrame, run_key: str, run_label: str) -> pd.DataFrame:
+    if trades is None or trades.empty:
+        return pd.DataFrame()
+    out = trades.copy()
+    out["run_key"] = run_key
+    out["run_label"] = run_label
+    out["abs_pnl_cents"] = out["net_pnl_cents"].abs()
+    cols = [
+        "run_key",
+        "run_label",
+        "entry_time_dubai",
+        "exit_time_dubai",
+        "side",
+        "move_cents",
+        "threshold_cents",
+        "net_pnl_cents",
+        "abs_pnl_cents",
+        "selected_params",
+    ]
+    return out.sort_values("abs_pnl_cents", ascending=False)[[c for c in cols if c in out.columns]].head(20)
+
+
 def main() -> None:
     bars, stats = load_second_prices(DATA_DIR, "2025-10-01", "2026-03-26", cache_dir=BASE_DIR / ".price_cache", workers=8)
     bars = add_volatility_columns(bars)
@@ -682,10 +956,21 @@ def main() -> None:
     all_daily = []
     all_rankings = []
     all_multiple_backtests = []
-    for vol_method in ["dollar", "percent_to_dollar"]:
+    all_robust_metrics = []
+    all_robust_decisions = []
+    all_robust_trades = []
+    all_robust_daily = []
+    all_robust_rankings = []
+    all_monthly_audit = []
+    all_repeated_clocks = []
+    all_top_trades = []
+
+    caches: dict[str, dict[VolParams, tuple[pd.Series, pd.DataFrame]]] = {}
+    for vol_method in ["percent_to_dollar"]:
         method_params = [p for p in params if p.vol_method == vol_method]
         print("precomputing", vol_method, "candidates", len(method_params), flush=True)
         cache = precompute_results(days, method_params)
+        caches[vol_method] = cache
         multiple_backtests = evaluate_multiple_backtests_cached(cache, method_params, WALKFORWARD_START, bars.index.max().normalize())
         if not multiple_backtests.empty:
             all_multiple_backtests.append(multiple_backtests)
@@ -713,8 +998,44 @@ def main() -> None:
                     rankings["vol_method"] = vol_method
                     all_rankings.append(rankings)
 
+                run_label = f"Baseline {objective_slug(objective).replace('_', ' ')}"
+                all_monthly_audit.extend(monthly_audit_rows(daily, trades, run_key, run_label))
+                all_repeated_clocks.extend(repeated_clock_rows(trades, run_key, run_label))
+                top_trades = top_trade_rows(trades, run_key, run_label)
+                if not top_trades.empty:
+                    all_top_trades.append(top_trades)
+
+    percent_params = [p for p in params if p.vol_method == "percent_to_dollar"]
+    robust_specs: list[tuple[str, str, Iterable[VolParams], bool]] = [
+        ("robust_percent_all", "Robust percent-vol: all directions", percent_params, False),
+        ("robust_percent_strict", "Strict robust percent-vol: sit out if unstable", percent_params, True),
+        ("robust_percent_continuation", "Robust percent-vol: continuation only", [p for p in percent_params if p.signal_mode == "continuation"], False),
+        ("robust_percent_reversal", "Robust percent-vol: reversal only", [p for p in percent_params if p.signal_mode == "reversal"], False),
+    ]
+    percent_cache = caches["percent_to_dollar"]
+    for run_key, run_label, run_params, strict in robust_specs:
+        run_params = list(run_params)
+        print("running", run_key, "candidates", len(run_params), flush=True)
+        decisions, trades, daily, rankings = run_robust_walkforward_cached(percent_cache, bars, run_params, run_key, run_label, strict=strict)
+        metrics = compute_metrics(daily, trades)
+        concentration = concentration_metrics(daily, trades)
+        all_robust_metrics.append({"run_key": run_key, "run_label": run_label, "objective": ROBUST_OBJECTIVE_NAME, **metrics, **concentration})
+        if not decisions.empty:
+            all_robust_decisions.append(decisions)
+        if not trades.empty:
+            all_robust_trades.append(trades)
+        if not daily.empty:
+            all_robust_daily.append(daily.rename(run_key))
+        if not rankings.empty:
+            all_robust_rankings.append(rankings)
+        all_monthly_audit.extend(monthly_audit_rows(daily, trades, run_key, run_label))
+        all_repeated_clocks.extend(repeated_clock_rows(trades, run_key, run_label))
+        top_trades = top_trade_rows(trades, run_key, run_label)
+        if not top_trades.empty:
+            all_top_trades.append(top_trades)
+
     pd.DataFrame(all_metrics).sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False).to_csv(OUT_DIR / "metrics.csv", index=False)
-    pd.concat(all_decisions, ignore_index=True).to_csv(OUT_DIR / "decisions.csv", index=False)
+    (pd.concat(all_decisions, ignore_index=True) if all_decisions else pd.DataFrame()).to_csv(OUT_DIR / "decisions.csv", index=False)
     (pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()).to_csv(OUT_DIR / "trades.csv", index=False)
     pd.concat(all_daily, axis=1).to_csv(OUT_DIR / "daily_pnl.csv")
     (pd.concat(all_rankings, ignore_index=True) if all_rankings else pd.DataFrame()).to_csv(OUT_DIR / "train_rankings.csv", index=False)
@@ -722,6 +1043,14 @@ def main() -> None:
         OUT_DIR / "multiple_backtests.csv",
         index=False,
     )
+    pd.DataFrame(all_robust_metrics).sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False).to_csv(OUT_DIR / "robust_metrics.csv", index=False)
+    (pd.concat(all_robust_decisions, ignore_index=True) if all_robust_decisions else pd.DataFrame()).to_csv(OUT_DIR / "robust_decisions.csv", index=False)
+    (pd.concat(all_robust_trades, ignore_index=True) if all_robust_trades else pd.DataFrame()).to_csv(OUT_DIR / "robust_trades.csv", index=False)
+    pd.concat(all_robust_daily, axis=1).to_csv(OUT_DIR / "robust_daily_pnl.csv")
+    (pd.concat(all_robust_rankings, ignore_index=True) if all_robust_rankings else pd.DataFrame()).to_csv(OUT_DIR / "robust_train_rankings.csv", index=False)
+    pd.DataFrame(all_monthly_audit).to_csv(OUT_DIR / "stability_monthly_audit.csv", index=False)
+    pd.DataFrame(all_repeated_clocks).to_csv(OUT_DIR / "stability_repeated_clocks.csv", index=False)
+    (pd.concat(all_top_trades, ignore_index=True) if all_top_trades else pd.DataFrame()).to_csv(OUT_DIR / "stability_top_trades.csv", index=False)
     pd.DataFrame(
         [
             {
@@ -731,12 +1060,14 @@ def main() -> None:
                 "candidate_count": int(len(params)),
                 "train_months": TRAIN_MONTHS,
                 "rebalance_options": "monthly",
-                "vol_methods": "dollar,percent_to_dollar",
+                "vol_methods": "percent_to_dollar",
                 "vol_windows_days": "63",
                 "sigma_multiples": ",".join(f"{x:g}" for x in SIGMA_MULTIPLES),
                 "walkforward_test_start": WALKFORWARD_START.date().isoformat(),
                 "early_rebalance_training": "Nov uses Oct only; Dec uses Oct-Nov; Jan onward uses rolling 3 months",
                 "vol_min_observations": VOL_MIN_OBSERVATIONS,
+                "full_signal_window_in_session": REQUIRE_FULL_SIGNAL_WINDOW_IN_SESSION,
+                "robust_objective": "Sharpe plus top-trade-removed PnL and profitable-month rate, penalized for top-trade and best-month concentration",
                 "bad_hour_rules": "exit_by_midnight",
                 "session": "11:00-24:00 Dubai signal time",
                 "cost_formula": f"round-trip cost cents = abs(entry_price) * {DYNAMIC_COST_CENTS_PER_PRICE_UNIT:g}",

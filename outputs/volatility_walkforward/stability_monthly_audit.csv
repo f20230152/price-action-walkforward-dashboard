@@ -1,0 +1,27 @@
+run_key,run_label,month,month_pnl_cents,month_share_of_total,trades
+percent_to_dollar_monthly_sharpe_objective,Baseline sharpe objective,2025-11-01,-51.199600000000956,-0.02693501162212792,15
+percent_to_dollar_monthly_sharpe_objective,Baseline sharpe objective,2025-12-01,-9.495200000000029,-0.004995221102399726,1
+percent_to_dollar_monthly_sharpe_objective,Baseline sharpe objective,2026-01-01,-16.749999999998934,-0.008811815808533768,20
+percent_to_dollar_monthly_sharpe_objective,Baseline sharpe objective,2026-02-01,-25.307199999997522,-0.013313575225654814,6
+percent_to_dollar_monthly_sharpe_objective,Baseline sharpe objective,2026-03-01,2003.6087999999995,1.054055623758716,18
+percent_to_dollar_monthly_pnl_objective,Baseline pnl objective,2025-11-01,-51.199600000000956,-0.027499155683389988,15
+percent_to_dollar_monthly_pnl_objective,Baseline pnl objective,2025-12-01,10.041999999999337,0.005393528882502575,22
+percent_to_dollar_monthly_pnl_objective,Baseline pnl objective,2026-01-01,-16.749999999998934,-0.008996376098577808,20
+percent_to_dollar_monthly_pnl_objective,Baseline pnl objective,2026-02-01,-83.84040000000203,-0.045030434068971295,20
+percent_to_dollar_monthly_pnl_objective,Baseline pnl objective,2026-03-01,2003.6087999999995,1.0761324369684362,18
+robust_percent_all,Robust percent-vol: all directions,2025-11-01,-51.199600000000956,-0.02693501162212792,15
+robust_percent_all,Robust percent-vol: all directions,2025-12-01,-9.495200000000029,-0.004995221102399726,1
+robust_percent_all,Robust percent-vol: all directions,2026-01-01,-16.749999999998934,-0.008811815808533768,20
+robust_percent_all,Robust percent-vol: all directions,2026-02-01,-25.307199999997522,-0.013313575225654814,6
+robust_percent_all,Robust percent-vol: all directions,2026-03-01,2003.6087999999995,1.054055623758716,18
+robust_percent_strict,Strict robust percent-vol: sit out if unstable,2025-11-01,-51.199600000000956,0.7534937659677325,15
+robust_percent_strict,Strict robust percent-vol: sit out if unstable,2025-12-01,0.0,-0.0,0
+robust_percent_strict,Strict robust percent-vol: sit out if unstable,2026-01-01,-16.749999999998934,0.24650623403226746,20
+robust_percent_continuation,Robust percent-vol: continuation only,2025-12-01,10.041999999999337,-0.1859891392121555,22
+robust_percent_continuation,Robust percent-vol: continuation only,2026-01-01,19.80599999999758,-0.3668294056199706,21
+robust_percent_continuation,Robust percent-vol: continuation only,2026-02-01,-83.84040000000203,1.5528185448321261,20
+robust_percent_reversal,Robust percent-vol: reversal only,2025-11-01,-51.199600000000956,-0.02693501162212792,15
+robust_percent_reversal,Robust percent-vol: reversal only,2025-12-01,-9.495200000000029,-0.004995221102399726,1
+robust_percent_reversal,Robust percent-vol: reversal only,2026-01-01,-16.749999999998934,-0.008811815808533768,20
+robust_percent_reversal,Robust percent-vol: reversal only,2026-02-01,-25.307199999997522,-0.013313575225654814,6
+robust_percent_reversal,Robust percent-vol: reversal only,2026-03-01,2003.6087999999995,1.054055623758716,18

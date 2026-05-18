@@ -147,6 +147,14 @@ def load_vol_outputs() -> dict[str, pd.DataFrame]:
         "winning_percent_metrics": "winning_percent_vol_backtest_metrics.csv",
         "winning_percent_daily": "winning_percent_vol_backtest_daily.csv",
         "winning_percent_trades": "winning_percent_vol_backtest_trades.csv",
+        "robust_metrics": "robust_metrics.csv",
+        "robust_decisions": "robust_decisions.csv",
+        "robust_trades": "robust_trades.csv",
+        "robust_daily": "robust_daily_pnl.csv",
+        "robust_rankings": "robust_train_rankings.csv",
+        "stability_monthly": "stability_monthly_audit.csv",
+        "stability_repeated": "stability_repeated_clocks.csv",
+        "stability_top_trades": "stability_top_trades.csv",
     }
     out = {}
     for key, name in files.items():
@@ -497,22 +505,16 @@ def render_walk_forward_tab(data: dict[str, pd.DataFrame]) -> None:
 
 
 def render_volatility_tab(vol_data: dict[str, pd.DataFrame], fixed_data: dict[str, pd.DataFrame], vol_method: str) -> None:
-    title = "Dollar Sigma" if vol_method == "dollar" else "Percent Vol Converted To Dollar Sigma"
+    title = "Baseline Percent-to-Dollar Walk-Forward"
     st.caption(
-        f"{title}: threshold = rolling 63-session sigma x optimized multiple. "
-        "The optimizer now uses monthly rebalance only, a 63-session volatility lookback with a 21-session early warm-up, "
-        "both signal directions, and a hard Dubai midnight exit."
+        "True walk-forward: each month chooses parameters using only past data, then trades the next unseen month. "
+        "This baseline still optimizes for Sharpe or PnL, so it can be less stable than the robust versions."
     )
-    if vol_method == "dollar":
-        st.info(
-            "Dollar Sigma uses the rolling standard deviation of absolute close-to-close dollar moves. "
-            "Example: if the 63-session sigma is $2.00 and the selected multiple is 0.40x, the trigger is an 80 cent move."
-        )
-    else:
-        st.info(
-            "Percent-to-Dollar first measures volatility as percent returns, then converts that volatility back into dollars at the price level. "
-            "This normalizes for price level before calculating the trigger."
-        )
+    st.info(
+        "Percent-to-Dollar means: calculate volatility from daily percent returns, convert that back into dollar terms at the current price level, "
+        "then trigger when the intraday move is greater than `sigma multiple x rolling dollar-equivalent volatility`. "
+        "The signal now requires the full 30-minute move window to be inside 11:00-24:00 Dubai time, so 11:02 entries caused by pre-session moves are filtered out."
+    )
     metrics = vol_data["metrics"]
     decisions = vol_data["decisions"]
     trades = vol_data["trades"]
@@ -533,34 +535,6 @@ def render_volatility_tab(vol_data: dict[str, pd.DataFrame], fixed_data: dict[st
     best = method_metrics.sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False).iloc[0]
     st.subheader("Best Volatility-Scaled Result")
     metric_tiles(best)
-
-    fixed_metrics = fixed_data["metrics"]
-    if not fixed_metrics.empty:
-        fixed_best = fixed_metrics.sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False).iloc[0]
-        compare = pd.DataFrame(
-            [
-                {
-                    "model": "Fixed cents best",
-                    "run": objective_label(fixed_best["selector_objective"]),
-                    "total_pnl_cents": fixed_best["total_pnl_cents"],
-                    "sharpe": fixed_best["daily_sharpe"],
-                    "max_drawdown_cents": fixed_best["max_drawdown_cents"],
-                    "trades": fixed_best["trades"],
-                    "profit_factor": fixed_best["profit_factor"],
-                },
-                {
-                    "model": title,
-                    "run": clean_label(best["run_key"]),
-                    "total_pnl_cents": best["total_pnl_cents"],
-                    "sharpe": best["daily_sharpe"],
-                    "max_drawdown_cents": best["max_drawdown_cents"],
-                    "trades": best["trades"],
-                    "profit_factor": best["profit_factor"],
-                },
-            ]
-        )
-        st.subheader("Comparison Against Fixed-Cent Strategy")
-        st.dataframe(compare, use_container_width=True, hide_index=True)
 
     st.subheader("All Rebalance Results")
     show_metrics = method_metrics[
@@ -710,10 +684,190 @@ def render_volatility_tab(vol_data: dict[str, pd.DataFrame], fixed_data: dict[st
         st.dataframe(display_table(rankings[rankings["run_key"] == run_key]), use_container_width=True, hide_index=True)
 
 
+def render_robust_walkforward_tab(vol_data: dict[str, pd.DataFrame]) -> None:
+    st.caption(
+        "Robust walk-forward uses the same monthly train-then-test process, but changes how parameters are selected. "
+        "It rewards positive Sharpe, PnL after removing the best trade, and profitable-month consistency, while penalizing dependence on one trade or one month."
+    )
+    st.info(
+        "Simple language: this tab asks, 'Which parameter is less likely to be a lucky March-only result?' "
+        "Technical language: score = Sharpe + top-trade-removed PnL + profitable-month rate - concentration penalties."
+    )
+
+    metrics = vol_data["robust_metrics"]
+    decisions = vol_data["robust_decisions"]
+    trades = vol_data["robust_trades"]
+    daily = vol_data["robust_daily"]
+    rankings = vol_data["robust_rankings"]
+
+    if metrics.empty:
+        st.warning("Robust walk-forward outputs are missing. Run `python volatility_walkforward_research.py` first.")
+        return
+
+    show_cols = [
+        "run_key",
+        "run_label",
+        "total_pnl_cents",
+        "daily_sharpe",
+        "max_drawdown_cents",
+        "trades",
+        "win_rate",
+        "profit_factor",
+        "profitable_month_rate",
+        "top_trade_pnl_cents",
+        "top_trade_share",
+        "best_month_pnl_cents",
+        "best_month_share",
+        "top_trade_removed_pnl_cents",
+    ]
+    st.subheader("Robust Walk-Forward Results")
+    st.dataframe(display_table(metrics[[c for c in show_cols if c in metrics.columns]].sort_values(["daily_sharpe", "total_pnl_cents"], ascending=False)), use_container_width=True, hide_index=True)
+
+    run_key = st.selectbox(
+        "Robust run",
+        metrics["run_key"].tolist(),
+        index=0,
+        format_func=lambda x: str(metrics.loc[metrics["run_key"].eq(x), "run_label"].iloc[0]) if x in metrics["run_key"].values else clean_label(x),
+        key="robust_run_key",
+    )
+
+    selected_metrics = metrics[metrics["run_key"] == run_key].iloc[0]
+    metric_tiles(selected_metrics)
+
+    selected_decisions = decisions[decisions["run_key"] == run_key].copy()
+    st.subheader("Monthly Rebalance Decisions")
+    st.caption(
+        "`train_*` columns show what the optimizer saw in the past window. "
+        "`test_*` columns show what happened in the next unseen month."
+    )
+    decision_cols = [
+        "test_start",
+        "test_end",
+        "selected_params",
+        "train_score",
+        "train_total_pnl_cents",
+        "train_sharpe",
+        "train_top_trade_removed_pnl_cents",
+        "train_top_trade_share",
+        "test_total_pnl_cents",
+        "test_sharpe",
+        "test_trades",
+        "test_top_trade_removed_pnl_cents",
+        "test_top_trade_share",
+    ]
+    st.dataframe(display_table(selected_decisions[[c for c in decision_cols if c in selected_decisions.columns]]), use_container_width=True, hide_index=True)
+
+    if not selected_decisions.empty:
+        fig = px.bar(
+            selected_decisions,
+            x="test_start",
+            y="test_total_pnl_cents",
+            color="test_total_pnl_cents",
+            color_continuous_scale="RdYlGn",
+            title="OOS PnL By Rebalance Month",
+            labels={"test_start": "Out-of-sample month", "test_total_pnl_cents": "PnL cents"},
+        )
+        fig.update_layout(height=350, margin=dict(l=10, r=10, t=45, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+    if not daily.empty and run_key in daily.columns:
+        date_col = daily.columns[0]
+        curve = daily[[date_col, run_key]].copy()
+        curve[date_col] = pd.to_datetime(curve[date_col])
+        curve["equity_cents"] = curve[run_key].fillna(0).cumsum()
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=curve[date_col], y=curve["equity_cents"], mode="lines", name=clean_label(run_key)))
+        fig.update_layout(
+            title="OOS Equity Curve",
+            xaxis_title="Date",
+            yaxis_title="Cumulative out-of-sample PnL in cents",
+            height=390,
+            margin=dict(l=10, r=10, t=45, b=10),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    selected_trades = trades[trades["run_key"] == run_key].copy() if not trades.empty else pd.DataFrame()
+    st.subheader("Trades Taken")
+    if selected_trades.empty:
+        st.info("No trades for this robust run.")
+    else:
+        display_cols = [
+            "test_start",
+            "signal_time_dubai",
+            "entry_time_dubai",
+            "exit_time_dubai",
+            "side",
+            "move_cents",
+            "threshold_cents",
+            "daily_sigma_dollars",
+            "sigma_multiple",
+            "entry_price",
+            "exit_price",
+            "net_pnl_cents",
+            "selected_params",
+        ]
+        st.dataframe(display_table(selected_trades[[c for c in display_cols if c in selected_trades.columns]]), use_container_width=True, hide_index=True)
+
+    with st.expander("Training Rankings For Selected Robust Run"):
+        st.dataframe(display_table(rankings[rankings["run_key"] == run_key]), use_container_width=True, hide_index=True)
+
+
+def render_stability_audit_tab(vol_data: dict[str, pd.DataFrame]) -> None:
+    st.caption(
+        "This tab is for distrust. It shows whether PnL is coming from one month, one trade, or repeated clock-time artifacts."
+    )
+    st.info(
+        "The previous repeated 11:02 trades were caused by the 11:00 session boundary: a 30-minute move from before 11:00 could trigger exactly at 11:00, "
+        "then enter at 11:02 after the 120-second delay. The current research run filters those out by requiring the full lookback window inside session."
+    )
+    monthly = vol_data["stability_monthly"]
+    repeated = vol_data["stability_repeated"]
+    top_trades = vol_data["stability_top_trades"]
+
+    if monthly.empty and repeated.empty and top_trades.empty:
+        st.warning("Stability audit outputs are missing. Run `python volatility_walkforward_research.py` first.")
+        return
+
+    run_options = sorted(set(monthly.get("run_key", pd.Series(dtype=str)).dropna().tolist()) | set(top_trades.get("run_key", pd.Series(dtype=str)).dropna().tolist()))
+    if not run_options:
+        st.info("No audit rows available.")
+        return
+    run_key = st.selectbox("Audit run", run_options, format_func=clean_label, key="audit_run_key")
+
+    st.subheader("Monthly Contribution")
+    selected_monthly = monthly[monthly["run_key"] == run_key].copy() if not monthly.empty else pd.DataFrame()
+    if not selected_monthly.empty:
+        st.dataframe(display_table(selected_monthly), use_container_width=True, hide_index=True)
+        fig = px.bar(
+            selected_monthly,
+            x="month",
+            y="month_pnl_cents",
+            color="month_pnl_cents",
+            color_continuous_scale="RdYlGn",
+            title="Monthly Contribution To OOS PnL",
+        )
+        fig.update_layout(height=330, margin=dict(l=10, r=10, t=45, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Largest Absolute Trades")
+    selected_top = top_trades[top_trades["run_key"] == run_key].copy() if not top_trades.empty else pd.DataFrame()
+    if selected_top.empty:
+        st.info("No top-trade rows for this run.")
+    else:
+        st.dataframe(display_table(selected_top), use_container_width=True, hide_index=True)
+
+    st.subheader("Repeated Entry Clock Times")
+    selected_repeated = repeated[repeated["run_key"] == run_key].copy() if not repeated.empty else pd.DataFrame()
+    if selected_repeated.empty:
+        st.success("No repeated entry clock times with count >= 2 for this run.")
+    else:
+        st.dataframe(display_table(selected_repeated.sort_values("count", ascending=False)), use_container_width=True, hide_index=True)
+
+
 def render_winning_percent_backtest_tab(vol_data: dict[str, pd.DataFrame]) -> None:
     st.caption(
-        "Single full-period diagnostic backtest for the best fixed Percent-to-Dollar volatility candidate. "
-        "This is not used to select walk-forward trades."
+        "This is a fixed-parameter diagnostic, not walk-forward. It uses the best single Percent-to-Dollar parameter after looking at the full period, "
+        "so it can be overfit and should not be treated as live-like performance."
     )
     metrics = vol_data["winning_percent_metrics"]
     daily = vol_data["winning_percent_daily"]
@@ -1077,28 +1231,22 @@ def main() -> None:
     data = load_outputs()
     vol_data = load_vol_outputs()
 
-    walk_forward_tab, vol_dollar_tab, vol_percent_tab, winning_percent_tab, excluded_tab, single_tab = st.tabs(
+    baseline_tab, robust_tab, fixed_diagnostic_tab, audit_tab = st.tabs(
         [
-            "Fixed-Cent Walk-Forward",
-            "Vol Dollar Sigma",
-            "Vol Percent-to-Dollar",
-            "Winning Percent Vol Backtest",
-            "Out-Of-Session Analysis",
-            "Single Parameter Backtest",
+            "Baseline Percent-Vol WF",
+            "Robust Percent-Vol WF",
+            "Fixed Winner Diagnostic",
+            "Stability Audit",
         ]
     )
-    with walk_forward_tab:
-        render_walk_forward_tab(data)
-    with vol_dollar_tab:
-        render_volatility_tab(vol_data, data, "dollar")
-    with vol_percent_tab:
+    with baseline_tab:
         render_volatility_tab(vol_data, data, "percent_to_dollar")
-    with winning_percent_tab:
+    with robust_tab:
+        render_robust_walkforward_tab(vol_data)
+    with fixed_diagnostic_tab:
         render_winning_percent_backtest_tab(vol_data)
-    with excluded_tab:
-        render_out_of_session_tab(data)
-    with single_tab:
-        render_single_backtest_tab()
+    with audit_tab:
+        render_stability_audit_tab(vol_data)
 
 
 if __name__ == "__main__":
