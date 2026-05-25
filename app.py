@@ -21,6 +21,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 OUT_DIR = APP_DIR / "outputs" / "clean_walkforward"
 VOL_OUT_DIR = APP_DIR / "outputs" / "volatility_walkforward"
+EXP_OUT_DIR = APP_DIR / "outputs" / "expanded_walkforward"
 REPORT_XLSX = OUT_DIR / "walkforward_report.xlsx"
 SINGLE_DEFAULT_TRADES = OUT_DIR / "single_default_trades.csv"
 SINGLE_DEFAULT_EXCLUDED = OUT_DIR / "single_default_out_of_session_trades.csv"
@@ -183,6 +184,37 @@ def load_vol_outputs() -> dict[str, pd.DataFrame]:
     out = {}
     for key, name in files.items():
         path = VOL_OUT_DIR / name
+        if not path.exists():
+            out[key] = pd.DataFrame()
+            continue
+        try:
+            out[key] = pd.read_csv(path)
+        except pd.errors.EmptyDataError:
+            out[key] = pd.DataFrame()
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=30)
+def load_expanded_outputs() -> dict[str, pd.DataFrame]:
+    files = {
+        "config": "config.csv",
+        "coverage": "data_coverage.csv",
+        "coverage_days": "data_coverage_days.csv",
+        "winners": "winner_comparison.csv",
+        "fill_comparison": "fill_model_comparison.csv",
+        "metrics": "metrics.csv",
+        "decisions": "decisions.csv",
+        "trades": "trades.csv",
+        "daily": "daily_pnl.csv",
+        "top_trades": "top_trades.csv",
+        "monthly_audit": "monthly_audit.csv",
+        "rankings": "train_rankings.csv",
+        "universe": "parameter_universe.csv",
+        "validation": "validation_checks.csv",
+    }
+    out = {}
+    for key, name in files.items():
+        path = EXP_OUT_DIR / name
         if not path.exists():
             out[key] = pd.DataFrame()
             continue
@@ -1908,13 +1940,233 @@ def render_out_of_session_tab(data: dict[str, pd.DataFrame]) -> None:
     )
 
 
+def render_expanded_walkforward_tab(exp_data: dict[str, pd.DataFrame]) -> None:
+    winners = exp_data["winners"]
+    coverage = exp_data["coverage"]
+    metrics = exp_data["metrics"]
+    decisions = exp_data["decisions"]
+    trades = exp_data["trades"]
+    daily = exp_data["daily"]
+    fill_comparison = exp_data["fill_comparison"]
+    top_trades = exp_data["top_trades"]
+    monthly_audit = exp_data["monthly_audit"]
+    rankings = exp_data["rankings"]
+    universe = exp_data["universe"]
+    validation = exp_data["validation"]
+    config = exp_data["config"]
+
+    if winners.empty or metrics.empty:
+        st.warning("Expanded Jan 2025-Mar 2026 outputs are missing. Run `python expanded_walkforward_research.py` first.")
+        return
+
+    if not config.empty:
+        cfg = config.iloc[0]
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Data Start", str(cfg.get("data_start", ""))[:10])
+        c2.metric("Data End", str(cfg.get("data_end", ""))[:10])
+        c3.metric("Candidates", f"{int(cfg.get('candidate_count', 0)):,}")
+        c4.metric("Train/Test", f"{int(cfg.get('train_months', 3))}M / {int(cfg.get('test_months', 1))}M")
+        c5.metric("Trade Cap", str(cfg.get("max_trades_per_day", 1)))
+
+    st.subheader("Data Coverage")
+    if coverage.empty:
+        st.info("No data coverage summary was saved.")
+    else:
+        coverage_show = coverage[
+            [
+                "month",
+                "source_type",
+                "source_files",
+                "loaded_days",
+                "empty_source_files",
+                "missing_business_days",
+                "first_timestamp",
+                "last_timestamp",
+                "row_count",
+            ]
+        ].copy()
+        st.dataframe(display_table(coverage_show), use_container_width=True, hide_index=True)
+
+    if not validation.empty:
+        failed = validation[~validation["passed"].astype(bool)]
+        if failed.empty:
+            st.success("Validation checks passed: stitched timestamps, source-month split, session, one-trade cap, exits, and bid/ask fill direction.")
+        else:
+            st.error("One or more validation checks failed.")
+            st.dataframe(validation, use_container_width=True, hide_index=True)
+
+    st.subheader("Walk-Forward Rules")
+    rules = pd.DataFrame(
+        [
+            {"item": "Schedule", "value": "Train Jan-Mar 2025, test Apr 2025; roll 3-month train / 1-month test through Mar 2026."},
+            {"item": "Universe", "value": "a=60/90/120/180/300s, b=0.25x-1.05x sigma, c=900/1200/1800/2400/3600s, d=1800/3600/7200/14400/21600s, continuation/reversal."},
+            {"item": "Session", "value": "Signals 11:00-24:00 Dubai; the full move window must also be inside session."},
+            {"item": "Exit", "value": "Exit at min(entry + d, midnight Dubai), max one trade per UTC day."},
+            {"item": "Fills", "value": "Mid model uses dynamic round-trip cost; actual model uses bid/ask on parquet months and dynamic cost on CSV months."},
+        ]
+    )
+    st.dataframe(rules, use_container_width=True, hide_index=True)
+
+    st.subheader("Winner Comparison")
+    winner_cols = [
+        "winner_type",
+        "fill_model",
+        "run_label",
+        "total_pnl_cents",
+        "daily_sharpe",
+        "trades",
+        "max_drawdown_cents",
+        "top_trade_removed_pnl_cents",
+        "top_trade_share",
+        "best_month_share",
+        "deflated_total_pnl_cents",
+        "deflated_daily_sharpe",
+        "is_robust_by_tests",
+        "latest_selected_params",
+    ]
+    st.dataframe(display_table(winners[[c for c in winner_cols if c in winners.columns]]), use_container_width=True, hide_index=True)
+
+    if not fill_comparison.empty:
+        st.subheader("Fill-Model Comparison")
+        st.dataframe(display_table(fill_comparison), use_container_width=True, hide_index=True)
+
+    if not daily.empty:
+        st.plotly_chart(equity_figure(daily), use_container_width=True)
+
+    st.subheader("Monthly Rebalance Decisions")
+    run_options = metrics["run_key"].dropna().tolist()
+    default_idx = 0
+    robust_keys = [i for i, key in enumerate(run_options) if "robust_top_trade_neutral" in str(key)]
+    if robust_keys:
+        default_idx = robust_keys[0]
+    run_key = st.selectbox(
+        "Run",
+        options=run_options,
+        index=default_idx,
+        format_func=clean_label,
+        key="expanded_run_key",
+    )
+    selected_metrics = metrics[metrics["run_key"] == run_key]
+    if not selected_metrics.empty:
+        metric_tiles(selected_metrics.iloc[0])
+
+    selected_decisions = decisions[decisions["run_key"] == run_key].copy() if not decisions.empty else pd.DataFrame()
+    if selected_decisions.empty:
+        st.info("No monthly decisions for this run.")
+    else:
+        decision_cols = [
+            "fill_model",
+            "selector_kind",
+            "train_start",
+            "train_end",
+            "test_start",
+            "test_end",
+            "selected_params",
+            "train_total_pnl_cents",
+            "train_sharpe",
+            "train_trades",
+            "train_top_trade_removed_pnl_cents",
+            "train_cluster_positive_neighbors",
+            "test_total_pnl_cents",
+            "test_sharpe",
+            "test_trades",
+            "test_top_trade_removed_pnl_cents",
+            "test_deflated_total_pnl_cents",
+            "test_deflated_sharpe",
+        ]
+        st.dataframe(display_table(selected_decisions[[c for c in decision_cols if c in selected_decisions.columns]]), use_container_width=True, hide_index=True)
+
+        month_fig = px.bar(
+            selected_decisions,
+            x="test_start",
+            y="test_total_pnl_cents",
+            color="test_total_pnl_cents",
+            color_continuous_scale="RdYlGn",
+            title="Monthly OOS PnL",
+        )
+        month_fig.update_layout(height=340, margin=dict(l=10, r=10, t=45, b=10))
+        st.plotly_chart(month_fig, use_container_width=True)
+
+    st.subheader("Top-Trade Removal Diagnostics")
+    diagnostic_cols = [
+        "run_key",
+        "fill_model",
+        "selector_kind",
+        "total_pnl_cents",
+        "daily_sharpe",
+        "top_trade_pnl_cents",
+        "top_trade_removed_pnl_cents",
+        "top_trade_share",
+        "best_month_share",
+        "deflated_total_pnl_cents",
+        "deflated_daily_sharpe",
+    ]
+    st.dataframe(display_table(metrics[[c for c in diagnostic_cols if c in metrics.columns]]), use_container_width=True, hide_index=True)
+
+    selected_top = top_trades[top_trades["run_key"] == run_key].copy() if not top_trades.empty else pd.DataFrame()
+    if not selected_top.empty:
+        st.dataframe(display_table(selected_top), use_container_width=True, hide_index=True)
+
+    selected_monthly = monthly_audit[monthly_audit["run_key"] == run_key].copy() if not monthly_audit.empty else pd.DataFrame()
+    if not selected_monthly.empty:
+        month_contrib = px.bar(
+            selected_monthly,
+            x="month",
+            y="month_pnl_cents",
+            color="month_pnl_cents",
+            color_continuous_scale="RdYlGn",
+            title="Monthly Contribution",
+        )
+        month_contrib.update_layout(height=320, margin=dict(l=10, r=10, t=45, b=10))
+        st.plotly_chart(month_contrib, use_container_width=True)
+
+    st.subheader("Full Trade List")
+    selected_trades = trades[trades["run_key"] == run_key].copy() if not trades.empty else pd.DataFrame()
+    if selected_trades.empty:
+        st.info("No trades were taken for this run.")
+    else:
+        trade_cols = [
+            "test_start",
+            "signal_time_dubai",
+            "entry_time_dubai",
+            "exit_time_dubai",
+            "side",
+            "fill_source",
+            "source_type",
+            "selected_symbol",
+            "move_cents",
+            "threshold_cents",
+            "entry_price",
+            "exit_price",
+            "gross_pnl_cents",
+            "cost_cents",
+            "net_pnl_cents",
+            "exit_reason",
+            "selected_params",
+        ]
+        st.dataframe(display_table(selected_trades[[c for c in trade_cols if c in selected_trades.columns]]), use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download Expanded Trades CSV",
+            data=selected_trades.to_csv(index=False).encode("utf-8"),
+            file_name=f"expanded_trades_{run_key}.csv",
+            mime="text/csv",
+        )
+
+    with st.expander("Expanded Universe And Training Rankings"):
+        st.dataframe(display_table(universe), use_container_width=True, hide_index=True)
+        selected_rankings = rankings[rankings["run_key"] == run_key].copy() if not rankings.empty else pd.DataFrame()
+        st.dataframe(display_table(selected_rankings), use_container_width=True, hide_index=True)
+
+
 def main() -> None:
     st.title("Price Action Research Dashboard")
     data = load_outputs()
     vol_data = load_vol_outputs()
+    exp_data = load_expanded_outputs()
 
-    baseline_tab, stable_4var_tab, anti_overfit_tab, rare_move_tab, regime_rare_tab, robust_tab, fixed_diagnostic_tab, audit_tab = st.tabs(
+    expanded_tab, baseline_tab, stable_4var_tab, anti_overfit_tab, rare_move_tab, regime_rare_tab, robust_tab, fixed_diagnostic_tab, audit_tab = st.tabs(
         [
+            "Fresh Jan-Mar WF",
             "Baseline Percent-Vol WF",
             "Stable 4-Variable WF",
             "Anti-Overfit WF",
@@ -1925,6 +2177,8 @@ def main() -> None:
             "Stability Audit",
         ]
     )
+    with expanded_tab:
+        render_expanded_walkforward_tab(exp_data)
     with baseline_tab:
         render_volatility_tab(vol_data, data, "percent_to_dollar")
     with stable_4var_tab:

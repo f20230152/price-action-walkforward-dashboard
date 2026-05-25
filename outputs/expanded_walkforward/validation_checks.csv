@@ -1,0 +1,8 @@
+check,passed,details
+no_duplicate_timestamps_after_stitching,True,removed_before_final=2395
+parquet_jan_to_nov_only,True,"2025-01,2025-02,2025-03,2025-04,2025-05,2025-06,2025-07,2025-08,2025-09,2025-10,2025-11"
+csv_dec_to_mar_only,True,"2025-12,2026-01,2026-02,2026-03"
+signals_inside_11_to_midnight_dubai,True,violations=0
+max_one_trade_per_day_per_run,True,max_daily_trades=1
+exits_respect_hold_and_midnight_stop,True,violations=0
+actual_bid_ask_fill_direction,True,violations=0
