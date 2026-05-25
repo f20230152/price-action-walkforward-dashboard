@@ -1,16 +1,16 @@
-month,source_type,selected_symbol,days_loaded,expected_business_days,missing_business_days,missing_business_day_count,first_timestamp_utc,last_timestamp_utc,row_count,file_count
-2025-01,parquet_front_bid_ask,F:BRN\H25,22,23,2025-01-01,1,2025-01-02T06:00:00,2025-01-31T20:00:00,1108822,27
-2025-02,parquet_front_bid_ask,F:BRN\J25,20,20,,0,2025-02-03T06:00:00,2025-02-28T20:00:00,1008020,24
-2025-03,parquet_front_bid_ask,F:BRN\K25,21,21,,0,2025-03-03T06:00:00,2025-03-31T20:00:00,1058421,25
-2025-04,parquet_front_bid_ask,F:BRN\M25,21,22,2025-04-18,1,2025-04-01T06:00:00,2025-04-30T20:00:00,1058421,26
-2025-05,parquet_front_bid_ask,F:BRN\N25,21,22,2025-05-29,1,2025-05-01T06:00:00,2025-05-30T20:00:00,1058421,26
-2025-06,parquet_front_bid_ask,F:BRN\Q25,20,21,2025-06-26,1,2025-06-02T06:00:00,2025-06-30T20:00:00,1008020,24
-2025-07,parquet_front_bid_ask,F:BRN\U25,23,23,,0,2025-07-01T06:00:00,2025-07-31T20:00:00,1159223,27
-2025-08,parquet_front_bid_ask,F:BRN\V25,21,21,,0,2025-08-01T06:00:00,2025-08-29T20:00:00,1058421,26
-2025-09,parquet_front_bid_ask,F:BRN\X25,22,22,,0,2025-09-01T06:00:00,2025-09-30T20:00:00,1108822,26
-2025-10,parquet_front_bid_ask,F:BRN\Z25,23,23,,0,2025-10-01T06:00:00,2025-10-31T20:00:00,1159223,27
-2025-11,parquet_front_bid_ask,F:BRN\F26,20,20,,0,2025-11-03T06:00:00,2025-11-28T20:00:00,1008020,25
-2025-12,csv_mid_dynamic_cost,%BRN 1!-ICE,22,23,2025-12-25,1,2025-12-01T06:00:00,2025-12-31T20:00:00,1108822,22
-2026-01,csv_mid_dynamic_cost,%BRN 1!-ICE,21,22,2026-01-01,1,2026-01-02T06:00:00,2026-01-30T20:00:00,1058421,21
-2026-02,csv_mid_dynamic_cost,%BRN 1!-ICE,20,20,,0,2026-02-02T06:00:00,2026-02-27T20:00:00,1008020,20
-2026-03,csv_mid_dynamic_cost,%BRN 1!-ICE,19,22,2026-03-27;2026-03-30;2026-03-31,3,2026-03-02T06:00:00,2026-03-26T20:00:00,957619,19
+month,source_type,selected_symbol,days_loaded,expected_business_days,missing_business_days,missing_business_day_count,first_timestamp_utc,last_timestamp_utc,row_count,file_count,selection_rule,calendar_month,prompt_delivery_month,prompt_month_code,expected_prompt_symbol,contract_expiry_date
+2025-01,parquet_prompt_bid_ask,F:BRN\H25,22,23,2025-01-01,1,2025-01-02T06:00:00,2025-01-31T20:00:00,1108822,27,prompt_month_calendar_plus_2_using_ice_month_codes,2025-01,2025-03,H,F:BRN\H25,2025-01-31
+2025-02,parquet_prompt_bid_ask,F:BRN\J25,20,20,,0,2025-02-03T06:00:00,2025-02-28T20:00:00,1008020,24,prompt_month_calendar_plus_2_using_ice_month_codes,2025-02,2025-04,J,F:BRN\J25,2025-02-28
+2025-03,parquet_prompt_bid_ask,F:BRN\K25,21,21,,0,2025-03-03T06:00:00,2025-03-31T20:00:00,1058421,25,prompt_month_calendar_plus_2_using_ice_month_codes,2025-03,2025-05,K,F:BRN\K25,2025-03-31
+2025-04,parquet_prompt_bid_ask,F:BRN\M25,21,22,2025-04-18,1,2025-04-01T06:00:00,2025-04-30T20:00:00,1058421,26,prompt_month_calendar_plus_2_using_ice_month_codes,2025-04,2025-06,M,F:BRN\M25,2025-04-30
+2025-05,parquet_prompt_bid_ask,F:BRN\N25,21,22,2025-05-29,1,2025-05-01T06:00:00,2025-05-30T20:00:00,1058421,26,prompt_month_calendar_plus_2_using_ice_month_codes,2025-05,2025-07,N,F:BRN\N25,2025-05-30
+2025-06,parquet_prompt_bid_ask,F:BRN\Q25,20,21,2025-06-26,1,2025-06-02T06:00:00,2025-06-30T20:00:00,1008020,24,prompt_month_calendar_plus_2_using_ice_month_codes,2025-06,2025-08,Q,F:BRN\Q25,2025-06-30
+2025-07,parquet_prompt_bid_ask,F:BRN\U25,23,23,,0,2025-07-01T06:00:00,2025-07-31T20:00:00,1159223,27,prompt_month_calendar_plus_2_using_ice_month_codes,2025-07,2025-09,U,F:BRN\U25,2025-07-31
+2025-08,parquet_prompt_bid_ask,F:BRN\V25,21,21,,0,2025-08-01T06:00:00,2025-08-29T20:00:00,1058421,26,prompt_month_calendar_plus_2_using_ice_month_codes,2025-08,2025-10,V,F:BRN\V25,2025-08-29
+2025-09,parquet_prompt_bid_ask,F:BRN\X25,22,22,,0,2025-09-01T06:00:00,2025-09-30T20:00:00,1108822,26,prompt_month_calendar_plus_2_using_ice_month_codes,2025-09,2025-11,X,F:BRN\X25,2025-09-30
+2025-10,parquet_prompt_bid_ask,F:BRN\Z25,23,23,,0,2025-10-01T06:00:00,2025-10-31T20:00:00,1159223,27,prompt_month_calendar_plus_2_using_ice_month_codes,2025-10,2025-12,Z,F:BRN\Z25,2025-10-31
+2025-11,parquet_prompt_bid_ask,F:BRN\F26,20,20,,0,2025-11-03T06:00:00,2025-11-28T20:00:00,1008020,25,prompt_month_calendar_plus_2_using_ice_month_codes,2025-11,2026-01,F,F:BRN\F26,2025-11-28
+2025-12,csv_mid_dynamic_cost,%BRN 1!-ICE,22,23,2025-12-25,1,2025-12-01T06:00:00,2025-12-31T20:00:00,1108822,22,csv_continuous_front_symbol_from_legacy_data,2025-12,,,%BRN 1!-ICE,
+2026-01,csv_mid_dynamic_cost,%BRN 1!-ICE,21,22,2026-01-01,1,2026-01-02T06:00:00,2026-01-30T20:00:00,1058421,21,csv_continuous_front_symbol_from_legacy_data,2026-01,,,%BRN 1!-ICE,
+2026-02,csv_mid_dynamic_cost,%BRN 1!-ICE,20,20,,0,2026-02-02T06:00:00,2026-02-27T20:00:00,1008020,20,csv_continuous_front_symbol_from_legacy_data,2026-02,,,%BRN 1!-ICE,
+2026-03,csv_mid_dynamic_cost,%BRN 1!-ICE,19,22,2026-03-27;2026-03-30;2026-03-31,3,2026-03-02T06:00:00,2026-03-26T20:00:00,957619,19,csv_continuous_front_symbol_from_legacy_data,2026-03,,,%BRN 1!-ICE,

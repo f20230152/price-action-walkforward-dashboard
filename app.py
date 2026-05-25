@@ -15,6 +15,7 @@ OUT = APP_DIR / "outputs"
 
 REQUIRED_FILES = [
     "data_coverage.csv",
+    "prompt_contract_calendar.csv",
     "parameter_universe_stage1.csv",
     "parameter_universe_stage2.csv",
     "train_rankings.csv",
@@ -124,6 +125,7 @@ def main() -> None:
 
     verdict = outputs["verdict.json"]
     coverage = outputs["data_coverage.csv"]
+    prompt_calendar = outputs["prompt_contract_calendar.csv"]
     rankings = outputs["train_rankings.csv"]
     decisions = outputs["decisions.csv"]
     trades = outputs["trades.csv"]
@@ -283,10 +285,12 @@ def main() -> None:
 
     with tabs[8]:
         render_verdict_banner(verdict)
+        st.info("Jan-Nov parquet data is now an explicit prompt-contract series: calendar month plus two delivery months using ICE Brent month codes. Example: May -> July contract (N), June -> August contract (Q). Dec-Mar CSV remains the legacy continuous %BRN 1!-ICE series.")
         if not coverage.empty:
             fig = px.bar(coverage, x="month", y="row_count", color="source_type", title="Loaded Row Count by Month")
             st.plotly_chart(fig, use_container_width=True)
         show_table(coverage, "Data Coverage", "data_coverage")
+        show_table(prompt_calendar, "Prompt Contract Calendar", "prompt_contract_calendar")
         st.subheader("Validation Checks")
         st.dataframe(pass_style(validation), use_container_width=True, height=360)
         download_table(validation, "Validation Checks", "validation_checks")
@@ -294,4 +298,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

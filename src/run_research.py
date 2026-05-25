@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .data_loader import load_research_dataset
+from .data_loader import load_research_dataset, prompt_contract_symbol
 from .engine import generate_base_trades, stage1_universe, summarize_daily_monthly
 from .full_period import choose_final_parameters, run_full_period_backtests
 from .robustness import build_robustness_outputs
@@ -68,6 +68,38 @@ def _build_fill_model_comparison(summary: pd.DataFrame) -> pd.DataFrame:
                 "model_b_randomized_entry_p_value": actual_row["randomized_entry_p_value"],
                 "model_a_top_3_trade_removed_pnl_cents": mid_row["top_3_trade_removed_pnl_cents"],
                 "model_b_top_3_trade_removed_pnl_cents": actual_row["top_3_trade_removed_pnl_cents"],
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _build_prompt_contract_calendar(data: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    parquet = data[data["source_type"].astype(str).str.startswith("parquet")].copy()
+    if parquet.empty:
+        return pd.DataFrame()
+    for date_value, group in parquet.groupby("utc_date", sort=True):
+        first = group.iloc[0]
+        rows.append(
+            {
+                "date": date_value,
+                "calendar_month": str(pd.Timestamp(date_value).to_period("M")),
+                "chosen_symbol": first.get("selected_symbol", ""),
+                "prompt_delivery_month": first.get("prompt_delivery_month", ""),
+                "prompt_month_code": first.get("prompt_month_code", ""),
+                "contract_expiry_date": first.get("contract_expiry_date", ""),
+                "days_to_expiry": (
+                    pd.Timestamp(first.get("contract_expiry_date")) - pd.Timestamp(date_value)
+                ).days
+                if first.get("contract_expiry_date", "")
+                else np.nan,
+                "total_volume_that_day": first.get("total_volume_that_day", np.nan),
+                "rank_by_volume_among_available_symbols": first.get("rank_by_volume_among_available_symbols", np.nan),
+                "available_symbol_count": first.get("available_symbol_count", np.nan),
+                "selection_rule": first.get("contract_selection_rule", ""),
+                "row_count": int(len(group)),
+                "first_timestamp_utc": group.index.min().isoformat(),
+                "last_timestamp_utc": group.index.max().isoformat(),
             }
         )
     return pd.DataFrame(rows)
@@ -153,11 +185,21 @@ def _build_validation_checks(
         rows.append({"check": name, "pass": bool(passed), "details": details})
 
     source_by_month = data.groupby("month")["source_type"].agg(lambda s: sorted(set(s))).to_dict()
-    jan_nov_ok = all(source_by_month.get(f"2025-{m:02d}") == ["parquet_front_bid_ask"] for m in range(1, 12))
+    jan_nov_ok = all(source_by_month.get(f"2025-{m:02d}") == ["parquet_prompt_bid_ask"] for m in range(1, 12))
     dec_mar_ok = all(source_by_month.get(m) == ["csv_mid_dynamic_cost"] for m in ["2025-12", "2026-01", "2026-02", "2026-03"])
     csv_files = [Path(p).stem for p in manifest.get("csv_files_used", [])]
     no_old = not any(name.startswith("2025-10") or name.startswith("2025-11") for name in csv_files)
     add("data_source_scope", jan_nov_ok and dec_mar_ok and no_old, f"jan_nov_parquet={jan_nov_ok}; dec_mar_csv={dec_mar_ok}; no_old_oct_nov_csv={no_old}")
+    prompt_ok = True
+    prompt_details = []
+    for month in range(1, 12):
+        month_key = f"2025-{month:02d}"
+        expected = prompt_contract_symbol(2025, month)
+        seen = sorted(set(data.loc[data["month"] == month_key, "selected_symbol"].dropna().astype(str)))
+        ok = seen == [expected]
+        prompt_ok = prompt_ok and ok
+        prompt_details.append(f"{month_key}:{expected}:{ok}")
+    add("prompt_contract_month_plus_2_mapping", prompt_ok, ";".join(prompt_details))
     add("no_duplicate_timestamps_after_stitching", not data.index.duplicated().any(), f"duplicates={int(data.index.duplicated().sum())}")
     if oos_trades.empty:
         add("entries_inside_dubai_session", False, "no_oos_trades")
@@ -210,6 +252,8 @@ def main() -> None:
     print("Loading Jan 2025-Mar 2026 research dataset")
     data, coverage, manifest = load_research_dataset(REPO_ROOT)
     _save_csv(coverage, "data_coverage.csv")
+    prompt_calendar = _build_prompt_contract_calendar(data)
+    _save_csv(prompt_calendar, "prompt_contract_calendar.csv")
     print("Building Stage 1 parameter universe")
     params_stage1 = stage1_universe()
     _save_csv(params_stage1, "parameter_universe_stage1.csv")
@@ -264,4 +308,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

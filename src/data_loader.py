@@ -15,6 +15,21 @@ CSV_START = pd.Timestamp("2025-12-01")
 CSV_END = pd.Timestamp("2026-03-31 23:59:59")
 PARQUET_START = pd.Timestamp("2025-01-01")
 REQUIRED_PARQUET_COLUMNS = ["second_utc", "symbol_ticker", "mid", "bid_last", "ask_last", "spread", "trade_volume"]
+VOLUME_RANK_COLUMNS = ["symbol_ticker", "trade_volume"]
+BRENT_MONTH_CODES = {
+    1: "F",
+    2: "G",
+    3: "H",
+    4: "J",
+    5: "K",
+    6: "M",
+    7: "N",
+    8: "Q",
+    9: "U",
+    10: "V",
+    11: "X",
+    12: "Z",
+}
 
 
 def _date_range_for_day(day: pd.Timestamp) -> pd.DatetimeIndex:
@@ -58,14 +73,38 @@ def _read_symbol_master(month_dir: Path) -> pd.DataFrame:
     return master
 
 
-def choose_front_contract(month_dir: Path, year: int, month: int) -> str:
+def prompt_delivery_month(year: int, month: int) -> pd.Timestamp:
+    """The prompt Brent series uses the contract month two calendar months ahead.
+
+    Examples: May 2025 -> July 2025 (N25), June 2025 -> August 2025 (Q25).
+    """
+
+    return pd.Timestamp(year=year, month=month, day=1) + pd.DateOffset(months=2)
+
+
+def prompt_contract_symbol(year: int, month: int) -> str:
+    delivery = prompt_delivery_month(year, month)
+    code = BRENT_MONTH_CODES[int(delivery.month)]
+    return f"F:BRN\\{code}{str(delivery.year)[-2:]}"
+
+
+def choose_prompt_contract(month_dir: Path, year: int, month: int) -> tuple[str, dict[str, Any]]:
     master = _read_symbol_master(month_dir)
-    month_start = pd.Timestamp(year=year, month=month, day=1)
-    candidates = master[master["expiration_dt"].notna()].copy()
-    candidates = candidates[candidates["expiration_dt"] >= month_start].sort_values(["expiration_dt", "symbol_ticker"])
-    if candidates.empty:
-        raise ValueError(f"No unexpired contract found for {year}-{month:02d}")
-    return str(candidates.iloc[0]["symbol_ticker"])
+    expected_symbol = prompt_contract_symbol(year, month)
+    match = master[master["symbol_ticker"] == expected_symbol].copy()
+    if match.empty:
+        raise ValueError(f"Prompt contract {expected_symbol} not found in symbol master for {year}-{month:02d}")
+    row = match.iloc[0]
+    delivery = prompt_delivery_month(year, month)
+    metadata = {
+        "selection_rule": "prompt_month_calendar_plus_2_using_ice_month_codes",
+        "calendar_month": f"{year:04d}-{month:02d}",
+        "prompt_delivery_month": delivery.strftime("%Y-%m"),
+        "prompt_month_code": BRENT_MONTH_CODES[int(delivery.month)],
+        "expected_prompt_symbol": expected_symbol,
+        "contract_expiry_date": pd.Timestamp(row["expiration_dt"]).date().isoformat() if pd.notna(row["expiration_dt"]) else "",
+    }
+    return expected_symbol, metadata
 
 
 def _read_filtered_parquet(path: Path, symbol_ticker: str) -> pd.DataFrame:
@@ -76,6 +115,35 @@ def _read_filtered_parquet(path: Path, symbol_ticker: str) -> pd.DataFrame:
     if not df.empty:
         df = df[df["symbol_ticker"] == symbol_ticker].copy()
     return df
+
+
+def _daily_symbol_volume_rank(file_paths: list[Path], selected_symbol: str) -> dict[str, Any]:
+    parts = []
+    for path in file_paths:
+        try:
+            raw = pd.read_parquet(path, columns=VOLUME_RANK_COLUMNS)
+        except Exception:
+            continue
+        if raw.empty:
+            continue
+        raw = raw.copy()
+        raw["trade_volume"] = pd.to_numeric(raw["trade_volume"], errors="coerce").fillna(0.0)
+        parts.append(raw[VOLUME_RANK_COLUMNS])
+    if not parts:
+        return {
+            "total_volume_that_day": np.nan,
+            "rank_by_volume_among_available_symbols": np.nan,
+            "available_symbol_count": 0,
+        }
+    totals = pd.concat(parts, ignore_index=True).groupby("symbol_ticker")["trade_volume"].sum()
+    ranks = totals.rank(method="min", ascending=False).astype(int)
+    selected_total = float(totals[selected_symbol]) if selected_symbol in totals.index else np.nan
+    selected_rank = int(ranks[selected_symbol]) if selected_symbol in ranks.index else np.nan
+    return {
+        "total_volume_that_day": selected_total,
+        "rank_by_volume_among_available_symbols": selected_rank,
+        "available_symbol_count": int(len(totals)),
+    }
 
 
 def _coverage_row(
@@ -119,7 +187,7 @@ def load_parquet_month(raw_root: Path, year: int, month: int) -> tuple[pd.DataFr
     month_dir = raw_root / PARQUET_MONTH_TEMPLATE.format(month=month)
     if not month_dir.exists():
         raise FileNotFoundError(f"Missing Energin month folder: {month_dir}")
-    front_symbol = choose_front_contract(month_dir, year, month)
+    front_symbol, prompt_meta = choose_prompt_contract(month_dir, year, month)
     base = month_dir / "parquet" / "brent_1s_bars" / f"year={year}" / f"month={month:02d}"
     if not base.exists():
         raise FileNotFoundError(f"Missing parquet path: {base}")
@@ -129,8 +197,10 @@ def load_parquet_month(raw_root: Path, year: int, month: int) -> tuple[pd.DataFr
         if not day_dir.is_dir():
             continue
         day = pd.Timestamp(f"{year:04d}-{month:02d}-{day_dir.name.split('=')[-1]}")
+        day_files = sorted(day_dir.glob("*.parquet"))
+        volume_rank = _daily_symbol_volume_rank(day_files, front_symbol)
         day_frames = []
-        for file_path in sorted(day_dir.glob("*.parquet")):
+        for file_path in day_files:
             raw = _read_filtered_parquet(file_path, front_symbol)
             if not raw.empty:
                 files_used.append(str(file_path))
@@ -139,16 +209,24 @@ def load_parquet_month(raw_root: Path, year: int, month: int) -> tuple[pd.DataFr
             continue
         raw = pd.concat(day_frames, ignore_index=True)
         raw = _normalize_second_index(raw, "second_utc").rename(columns={"symbol_ticker": "selected_symbol"})
-        raw["source_type"] = "parquet_front_bid_ask"
+        raw["source_type"] = "parquet_prompt_bid_ask"
         raw["has_actual_bid_ask"] = raw["bid_last"].notna() & raw["ask_last"].notna()
         session = _session_reindex_one_day(raw, day)
         if not session.empty:
             session["selected_symbol"] = front_symbol
-            session["source_type"] = "parquet_front_bid_ask"
+            session["source_type"] = "parquet_prompt_bid_ask"
             session["has_actual_bid_ask"] = session["bid_last"].notna() & session["ask_last"].notna()
+            session["contract_expiry_date"] = prompt_meta["contract_expiry_date"]
+            session["prompt_delivery_month"] = prompt_meta["prompt_delivery_month"]
+            session["prompt_month_code"] = prompt_meta["prompt_month_code"]
+            session["contract_selection_rule"] = prompt_meta["selection_rule"]
+            session["total_volume_that_day"] = volume_rank["total_volume_that_day"]
+            session["rank_by_volume_among_available_symbols"] = volume_rank["rank_by_volume_among_available_symbols"]
+            session["available_symbol_count"] = volume_rank["available_symbol_count"]
             frames.append(session)
     month_df = pd.concat(frames).sort_index() if frames else pd.DataFrame()
-    coverage = _coverage_row(month_df, year, month, "parquet_front_bid_ask", front_symbol, len(files_used))
+    coverage = _coverage_row(month_df, year, month, "parquet_prompt_bid_ask", front_symbol, len(files_used))
+    coverage.update(prompt_meta)
     return month_df, coverage, files_used
 
 
@@ -172,6 +250,10 @@ def _load_csv_one_file(path: Path) -> pd.DataFrame:
     df["selected_symbol"] = "%BRN 1!-ICE"
     df["source_type"] = "csv_mid_dynamic_cost"
     df["has_actual_bid_ask"] = False
+    df["contract_expiry_date"] = ""
+    df["prompt_delivery_month"] = ""
+    df["prompt_month_code"] = ""
+    df["contract_selection_rule"] = "csv_continuous_front_symbol_from_legacy_data"
     return df
 
 
@@ -206,6 +288,16 @@ def load_csv_months(data_dir: Path) -> tuple[pd.DataFrame, list[dict[str, Any]],
                 sum(1 for f in files_used if Path(f).stem.startswith(str(period))),
             )
         )
+        coverage[-1].update(
+            {
+                "selection_rule": "csv_continuous_front_symbol_from_legacy_data",
+                "calendar_month": str(period),
+                "prompt_delivery_month": "",
+                "prompt_month_code": "",
+                "expected_prompt_symbol": "%BRN 1!-ICE",
+                "contract_expiry_date": "",
+            }
+        )
     return csv_df, coverage, files_used
 
 
@@ -237,6 +329,6 @@ def load_research_dataset(repo_root: Path, raw_root: Path = RAW_ROOT) -> tuple[p
         "rows": int(len(combined)),
         "first_timestamp_utc": combined.index.min().isoformat() if not combined.empty else "",
         "last_timestamp_utc": combined.index.max().isoformat() if not combined.empty else "",
+        "contract_selection_rule": "Jan-Nov parquet uses calendar month + 2 delivery months via ICE Brent month codes; Dec-Mar CSV uses legacy continuous %BRN 1!-ICE.",
     }
     return combined, pd.DataFrame(coverage_rows), manifest
-

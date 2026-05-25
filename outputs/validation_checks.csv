@@ -1,5 +1,6 @@
 check,pass,details
 data_source_scope,True,jan_nov_parquet=True; dec_mar_csv=True; no_old_oct_nov_csv=True
+prompt_contract_month_plus_2_mapping,True,2025-01:F:BRN\H25:True;2025-02:F:BRN\J25:True;2025-03:F:BRN\K25:True;2025-04:F:BRN\M25:True;2025-05:F:BRN\N25:True;2025-06:F:BRN\Q25:True;2025-07:F:BRN\U25:True;2025-08:F:BRN\V25:True;2025-09:F:BRN\X25:True;2025-10:F:BRN\Z25:True;2025-11:F:BRN\F26:True
 no_duplicate_timestamps_after_stitching,True,duplicates=0
 entries_inside_dubai_session,True,bad_entries=0
 exits_respect_hold_and_midnight,True,bad_exits=0

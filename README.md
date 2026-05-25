@@ -5,6 +5,7 @@ Clean-slate Streamlit dashboard for the Jan 2025-Mar 2026 Brent price-action res
 The pipeline:
 
 - Loads Jan-Nov 2025 from external Energin parquet files on `D:\Energin Raw Data`.
+- Builds Jan-Nov as an explicit Brent prompt-contract series: calendar month plus two delivery months using ICE month codes (`F/G/H/J/K/M/N/Q/U/V/X/Z`). For example, May 2025 uses the July contract `N25`; June 2025 uses the August contract `Q25`.
 - Loads Dec 2025-Mar 2026 from committed CSV files in `data/`.
 - Runs 3-month and 6-month rolling walk-forward schedules.
 - Selects parameters with train-only robustness gates, not OOS PnL.
@@ -25,4 +26,3 @@ streamlit run app.py --server.address 127.0.0.1 --server.port 8502
 ```
 
 Streamlit Cloud reads committed `outputs/` CSV and JSON files. It does not need the D-drive raw data at runtime.
-
