@@ -1,5 +1,0 @@
-run_key,run_label,entry_clock,count,dates,total_pnl_cents,avg_pnl_cents
-percent_to_dollar_monthly_pnl_objective,Baseline pnl objective,11:32:00,2,"2025-12-11, 2026-03-10",319.8064000000005,159.90320000000025
-robust_percent_continuation,Robust percent-vol: continuation only,11:32:00,7,"2025-12-11, 2026-03-02, 2026-03-09, 2026-03-10, 2026-03-11, 2026-03-12, 2026-03-20",85.31999999999995,12.188571428571422
-anti_overfit_percent_wf,Anti-overfit top-trade-neutral walk-forward,11:43:00,5,"2026-03-02, 2026-03-09, 2026-03-10, 2026-03-11, 2026-03-12",389.9867999999975,77.9973599999995
-rare_move_percentile_wf,Rare move percentile walk-forward,11:10:00,3,"2026-03-04, 2026-03-09, 2026-03-10",-410.53160000000094,-136.84386666666697

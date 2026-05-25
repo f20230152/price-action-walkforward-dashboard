@@ -1,6 +1,0 @@
-run_key,run_label,objective,train_start,train_end,test_start,test_end,selected_params,test_total_pnl_cents,test_sharpe,test_trades
-regime_rare_move_wf,Regime-gated rare move walk-forward,regime_rare_move_stability_score,2025-10-01,2025-10-31,2025-11-01,2025-11-30,NO_STABLE_REGIME_RARE_MOVE_CANDIDATE,0.0,0.0,0
-regime_rare_move_wf,Regime-gated rare move walk-forward,regime_rare_move_stability_score,2025-10-01,2025-11-30,2025-12-01,2025-12-31,NO_STABLE_REGIME_RARE_MOVE_CANDIDATE,0.0,0.0,0
-regime_rare_move_wf,Regime-gated rare move walk-forward,regime_rare_move_stability_score,2025-10-01,2025-12-31,2026-01-01,2026-01-31,NO_STABLE_REGIME_RARE_MOVE_CANDIDATE,0.0,0.0,0
-regime_rare_move_wf,Regime-gated rare move walk-forward,regime_rare_move_stability_score,2025-11-01,2026-01-31,2026-02-01,2026-02-28,NO_STABLE_REGIME_RARE_MOVE_CANDIDATE,0.0,0.0,0
-regime_rare_move_wf,Regime-gated rare move walk-forward,regime_rare_move_stability_score,2025-12-01,2026-02-28,2026-03-01,2026-03-26,NO_STABLE_REGIME_RARE_MOVE_CANDIDATE,0.0,0.0,0

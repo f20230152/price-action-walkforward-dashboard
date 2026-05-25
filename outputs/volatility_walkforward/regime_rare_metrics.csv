@@ -1,2 +1,0 @@
-run_key,run_label,objective,total_pnl_cents,avg_daily_pnl_cents,daily_sharpe,daily_sortino,max_drawdown_cents,positive_day_rate,active_day_rate,days,trades,win_rate,avg_trade_cents,profit_factor,long_trades,short_trades,trades_per_day,profitable_months,month_count,profitable_month_rate,best_month_pnl_cents,best_month_share,top_trade_pnl_cents,top_trade_share,top_trade_removed_pnl_cents
-regime_rare_move_wf,Regime-gated rare move walk-forward,regime_rare_move_stability_score,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0,0,0.0,0.0,0.0,0,0,0.0,0,0,0.0,0.0,0.0,0.0,0.0,0.0
