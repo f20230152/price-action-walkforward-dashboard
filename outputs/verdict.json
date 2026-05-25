@@ -1,0 +1,48 @@
+{
+  "verdict": "NO STABLE EDGE",
+  "reasons": [
+    "3m_train_1m_test:top_3_trade_survival",
+    "3m_train_1m_test:top_month_survival",
+    "3m_train_1m_test:win_month_rate",
+    "3m_train_1m_test:parameter_stability",
+    "3m_train_1m_test:randomized_entry",
+    "3m_train_1m_test:bootstrap_ci",
+    "6m_train_1m_test:top_3_trade_survival",
+    "6m_train_1m_test:top_month_survival",
+    "6m_train_1m_test:win_month_rate",
+    "6m_train_1m_test:parameter_stability",
+    "6m_train_1m_test:randomized_entry",
+    "6m_train_1m_test:bootstrap_ci",
+    "model_b_parameter_family_differs_between_3m_and_6m"
+  ],
+  "model_b_same_parameter_family_3m_6m": false,
+  "model_b_common_3m_param": "a=120s | b=0.5x sigma | c=900s | d=7200s | reversal",
+  "model_b_common_6m_param": "a=120s | b=0.3x sigma | c=3600s | d=14400s | reversal",
+  "selected": {
+    "actual_bid_ask": {
+      "param_id": "a120_b0.5_c900_d7200_reversal",
+      "parameter_set": "a=120s | b=0.5x sigma | c=900s | d=7200s | reversal",
+      "selection_reason": "most_common_oos_fold_winner",
+      "primary_schedule_for_summary": "6m_train_1m_test",
+      "oos_total_pnl_cents": -234.92320000000956,
+      "oos_daily_sharpe": -0.7345355236036984,
+      "oos_win_month_rate": 0.3333333333333333,
+      "top_3_trade_removed_pnl_cents": -526.9232000000084,
+      "randomized_entry_p_value": 0.36663336663336665,
+      "bootstrap_mean_trade_ci_low": -7.266618639455781
+    },
+    "mid_dynamic_cost": {
+      "param_id": "a300_b0.3_c1800_d14400_reversal",
+      "parameter_set": "a=300s | b=0.3x sigma | c=1800s | d=14400s | reversal",
+      "selection_reason": "most_common_oos_fold_winner",
+      "primary_schedule_for_summary": "6m_train_1m_test",
+      "oos_total_pnl_cents": -291.3378000000031,
+      "oos_daily_sharpe": -0.9146149077312072,
+      "oos_win_month_rate": 0.2222222222222222,
+      "top_3_trade_removed_pnl_cents": -578.4108000000019,
+      "randomized_entry_p_value": 0.3196803196803197,
+      "bootstrap_mean_trade_ci_low": -7.657848639455835
+    }
+  },
+  "footnote_model_b": "Model B uses real bid/ask fills on Jan-Nov 2025 parquet rows; Dec 2025-Mar 2026 CSV rows fall back to mid plus dynamic cost because bid/ask is unavailable."
+}

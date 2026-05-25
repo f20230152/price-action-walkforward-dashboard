@@ -1,0 +1,10 @@
+check,pass,details
+data_source_scope,True,jan_nov_parquet=True; dec_mar_csv=True; no_old_oct_nov_csv=True
+no_duplicate_timestamps_after_stitching,True,duplicates=0
+entries_inside_dubai_session,True,bad_entries=0
+exits_respect_hold_and_midnight,True,bad_exits=0
+model_b_fill_sides_correct,True,long_ok=True; short_ok=True; status_ok=True
+max_one_trade_per_parameter_day,True,max_daily_trades=1
+walkforward_train_test_strictly_separated,True,folds=42
+selection_winner_highest_composite,True,bad_folds=0
+randomized_entry_resamples,True,"('3m_train_1m_test', 'actual_bid_ask'):1000;('3m_train_1m_test', 'mid_dynamic_cost'):1000;('6m_train_1m_test', 'actual_bid_ask'):1000;('6m_train_1m_test', 'mid_dynamic_cost'):1000"

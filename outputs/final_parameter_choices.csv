@@ -1,0 +1,3 @@
+fill_model,param_id,parameter_set,a,b,c,d,direction,selection_reason,fold_win_count
+actual_bid_ask,a120_b0.5_c900_d7200_reversal,a=120s | b=0.5x sigma | c=900s | d=7200s | reversal,120,0.5,900,7200,reversal,most_common_oos_fold_winner,4
+mid_dynamic_cost,a300_b0.3_c1800_d14400_reversal,a=300s | b=0.3x sigma | c=1800s | d=14400s | reversal,300,0.3,1800,14400,reversal,most_common_oos_fold_winner,4

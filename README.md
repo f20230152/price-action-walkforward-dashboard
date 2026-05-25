@@ -1,24 +1,28 @@
-# Price Action Walk-Forward Dashboard
+# Fresh Brent Price-Action Walk-Forward Dashboard
 
-Streamlit dashboard for the rule:
+Clean-slate Streamlit dashboard for the Jan 2025-Mar 2026 Brent price-action research run.
 
-> Enter `a` seconds after price moves `b` cents within `c` seconds, then hold for `d` seconds.
+The pipeline:
 
-The app reads daily `YYYY-MM-DD.csv` tick files from `data/` when present, otherwise from the parent Downloads folder. It normalizes duplicate `Time` columns, resamples to 1-second last price, and evaluates the rule in cents per one contract.
+- Loads Jan-Nov 2025 from external Energin parquet files on `D:\Energin Raw Data`.
+- Loads Dec 2025-Mar 2026 from committed CSV files in `data/`.
+- Runs 3-month and 6-month rolling walk-forward schedules.
+- Selects parameters with train-only robustness gates, not OOS PnL.
+- Compares mid plus dynamic cost against actual bid/ask fills where available.
+- Publishes an explicit verdict: stable edge, weak/episodic edge, or no stable edge.
 
-For Streamlit Community Cloud, keep the app entrypoint as `app.py`.
-
-## Run
+## Run Research
 
 ```powershell
 cd "C:\Users\taran\OneDrive\Desktop\Downloads\price_action_dashboard"
-streamlit run app.py
+python -m src.run_research
 ```
 
-## Notes
+## Run Dashboard
 
-- Default slippage is `2` cents per side (`4` cents round-trip).
-- Momentum mode buys after an up move and sells after a down move.
-- Fade mode does the opposite.
-- The walk-forward tab optimizes on the prior N months, then runs the selected a/b/c/d settings out of sample for the next month.
-- The rare-move tab estimates how often each `b`/`c` event happens, so thresholds can target sparse signals.
+```powershell
+streamlit run app.py --server.address 127.0.0.1 --server.port 8502
+```
+
+Streamlit Cloud reads committed `outputs/` CSV and JSON files. It does not need the D-drive raw data at runtime.
+
