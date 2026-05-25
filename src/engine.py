@@ -126,10 +126,23 @@ def trade_metrics(trades: pd.DataFrame, pnl_col: str = "pnl_cents") -> dict:
     }
 
 
-def _rolling_sigma_scaled(mid: np.ndarray, window: int) -> np.ndarray:
-    returns = pd.Series(mid, dtype="float64").diff()
-    min_periods = max(30, window // 3)
-    return returns.rolling(window=window, min_periods=min_periods).std().to_numpy() * np.sqrt(window)
+def rolling_sigma_real_prints(mid: np.ndarray, is_real_print: np.ndarray, window: int) -> tuple[np.ndarray, np.ndarray, int]:
+    """Sigma from real-print mid changes only, scaled by sqrt(window).
+
+    The scaling assumes independent one-second real-print changes. Missing
+    seconds are not forward-filled into the estimator. A signal is allowed
+    only when at least max(30, window // 4) real prints exist in the window.
+    """
+
+    min_periods = max(30, int(window) // 4)
+    mid_series = pd.Series(mid, dtype="float64")
+    real_mask = pd.Series(is_real_print, dtype=bool)
+    real_returns_sparse = pd.Series(np.nan, index=mid_series.index, dtype="float64")
+    real_returns_sparse.loc[real_mask] = mid_series.loc[real_mask].diff()
+    real_count = real_mask.astype(int).rolling(window=window, min_periods=1).sum()
+    sigma = real_returns_sparse.rolling(window=window, min_periods=min_periods).std() * np.sqrt(window)
+    sigma = sigma.mask(real_count < min_periods)
+    return sigma.to_numpy(dtype=float), real_count.to_numpy(dtype=float), min_periods
 
 
 def _fill_prices(entry: pd.Series, exit_row: pd.Series, side: int, source_type: str) -> dict:
@@ -181,21 +194,26 @@ def _fill_prices(entry: pd.Series, exit_row: pd.Series, side: int, source_type: 
     return out
 
 
-def generate_base_trades(data: pd.DataFrame, universe: pd.DataFrame) -> pd.DataFrame:
+def generate_base_trades(data: pd.DataFrame, universe: pd.DataFrame, return_diagnostics: bool = False):
     """Generate candidate trades.
 
-    Sigma is the close-to-close std of one-second mid changes over c, scaled by
-    sqrt(c) to make it comparable to the c-second price move.
+    Sigma is the std of real-print one-second mid changes over c, scaled by
+    sqrt(c) to make it comparable to the c-second price move. Forward-filled
+    bars remain available for exits, but they are not consumed by sigma.
     """
     if data.empty:
-        return pd.DataFrame()
+        empty = pd.DataFrame()
+        return (empty, empty) if return_diagnostics else empty
     data = data.sort_index()
     param_lookup = universe.set_index("param_id")["parameter_set"].to_dict()
     grouped = universe.groupby(["a", "b", "c"], sort=False)
     rows = []
+    skipped_rows = []
     for date_value, day_df in data.groupby(pd.Series(data.index.date, index=data.index), sort=True):
         day_df = day_df.sort_index()
         mid = day_df["mid"].to_numpy(dtype=float)
+        is_real_print = day_df.get("is_real_print", pd.Series(True, index=day_df.index)).fillna(False).to_numpy(dtype=bool)
+        was_forward_filled = day_df.get("was_forward_filled", pd.Series(False, index=day_df.index)).fillna(False).to_numpy(dtype=bool)
         if len(mid) < 7200 or np.isnan(mid).all():
             continue
         ts = day_df.index
@@ -213,19 +231,21 @@ def generate_base_trades(data: pd.DataFrame, universe: pd.DataFrame) -> pd.DataF
             delta = np.full(len(mid), np.nan)
             if len(mid) > c:
                 delta[c:] = mid[c:] - mid[:-c]
-            by_c[c] = (delta, _rolling_sigma_scaled(mid, c))
+            sigma, real_count, min_periods = rolling_sigma_real_prints(mid, is_real_print, c)
+            by_c[c] = (delta, sigma, real_count, min_periods)
         positions = np.arange(len(mid))
         for (a, b, c), group in grouped:
             a = int(a)
             b = float(b)
             c = int(c)
-            delta, sigma = by_c[c]
+            delta, sigma, real_count, min_periods = by_c[c]
             trigger = (
                 signal_session
                 & (positions + a < midnight_pos)
                 & np.isfinite(delta)
                 & np.isfinite(sigma)
                 & (sigma > 0)
+                & (real_count >= min_periods)
                 & (np.abs(delta) > b * sigma)
             )
             signal_positions = np.flatnonzero(trigger)
@@ -239,6 +259,41 @@ def generate_base_trades(data: pd.DataFrame, universe: pd.DataFrame) -> pd.DataF
             entry = day_df.iloc[entry_pos]
             entry_ts = ts[entry_pos]
             source_type = str(entry.get("source_type", ""))
+            day_days_to_expiry = entry.get("days_to_expiry", np.nan)
+            if pd.notna(day_days_to_expiry) and float(day_days_to_expiry) < 3:
+                skipped_rows.append(
+                    {
+                        "skip_reason": "near_expiry_lt_3_business_days",
+                        "date": pd.Timestamp(date_value).date().isoformat(),
+                        "signal_time_utc": ts[signal_pos],
+                        "entry_time_utc": entry_ts,
+                        "selected_symbol": entry.get("selected_symbol", ""),
+                        "contract_expiry_date": entry.get("contract_expiry_date", ""),
+                        "days_to_expiry": day_days_to_expiry,
+                        "a": a,
+                        "b": b,
+                        "c": c,
+                        "affected_parameter_count": int(len(group)),
+                    }
+                )
+                continue
+            if bool(was_forward_filled[entry_pos]):
+                skipped_rows.append(
+                    {
+                        "skip_reason": "forward_filled_entry",
+                        "date": pd.Timestamp(date_value).date().isoformat(),
+                        "signal_time_utc": ts[signal_pos],
+                        "entry_time_utc": entry_ts,
+                        "selected_symbol": entry.get("selected_symbol", ""),
+                        "contract_expiry_date": entry.get("contract_expiry_date", ""),
+                        "days_to_expiry": day_days_to_expiry,
+                        "a": a,
+                        "b": b,
+                        "c": c,
+                        "affected_parameter_count": int(len(group)),
+                    }
+                )
+                continue
             for _, param in group.iterrows():
                 side = move_sign if param["direction"] == "continuation" else -move_sign
                 d = int(param["d"])
@@ -266,23 +321,34 @@ def generate_base_trades(data: pd.DataFrame, universe: pd.DataFrame) -> pd.DataF
                         "signal_time_utc": ts[signal_pos],
                         "signal_move_cents": float(delta[signal_pos] * 100.0),
                         "signal_sigma_cents": float(sigma[signal_pos] * 100.0),
+                        "signal_real_print_count": int(real_count[signal_pos]),
+                        "sigma_min_real_prints": int(min_periods),
+                        "signal_was_forward_filled": bool(was_forward_filled[signal_pos]),
                         "entry_time_utc": entry_ts,
                         "entry_time_dubai": entry_dubai,
                         "entry_dubai_date": entry_dubai.date().isoformat(),
+                        "entry_was_forward_filled": bool(was_forward_filled[entry_pos]),
                         "exit_time_utc": exit_ts,
                         "exit_time_dubai": exit_dubai,
+                        "exit_was_forward_filled": bool(was_forward_filled[exit_pos]),
                         "hold_seconds": int((exit_ts - entry_ts).total_seconds()),
                         "source_type": source_type,
                         "selected_symbol": entry.get("selected_symbol", ""),
+                        "contract_expiry_date": entry.get("contract_expiry_date", ""),
+                        "days_to_expiry": entry.get("days_to_expiry", np.nan),
+                        "roll_reason": entry.get("roll_reason", ""),
                         **fills,
                     }
                 )
     trades = pd.DataFrame(rows)
     if trades.empty:
-        return trades
+        skipped = pd.DataFrame(skipped_rows)
+        return (trades, skipped) if return_diagnostics else trades
     for col in ["signal_time_utc", "entry_time_utc", "entry_time_dubai", "exit_time_utc", "exit_time_dubai"]:
         trades[col] = pd.to_datetime(trades[col])
-    return trades.sort_values(["param_id", "entry_time_utc"]).reset_index(drop=True)
+    trades = trades.sort_values(["param_id", "entry_time_utc"]).reset_index(drop=True)
+    skipped = pd.DataFrame(skipped_rows)
+    return (trades, skipped) if return_diagnostics else trades
 
 
 def materialize_fill_trades(base_trades: pd.DataFrame, fill_model: str) -> pd.DataFrame:
@@ -327,4 +393,3 @@ def summarize_daily_monthly(trades: pd.DataFrame) -> tuple[pd.DataFrame, pd.Data
     equity = daily.sort_values(["schedule", "fill_model", "date"]).copy()
     equity["cum_pnl_cents"] = equity.groupby(["schedule", "fill_model"])["pnl_cents"].cumsum()
     return daily, monthly, equity
-

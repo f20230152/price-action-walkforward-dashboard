@@ -13,6 +13,8 @@ def _random_fill_pnl(data: pd.DataFrame, entry_ts: pd.Timestamp, exit_ts: pd.Tim
         return np.nan
     entry = data.loc[entry_ts]
     exit_row = data.loc[exit_ts]
+    if bool(entry.get("was_forward_filled", False)):
+        return np.nan
     entry_mid = float(entry["mid"])
     exit_mid = float(exit_row["mid"])
     mid_pnl = side * (exit_mid - entry_mid) * 100.0 - abs(entry_mid) * DYNAMIC_COST_CENTS_PER_PRICE_UNIT
@@ -165,4 +167,3 @@ def daily_sharpe_from_trades(trades: pd.DataFrame) -> float:
     if trades.empty:
         return 0.0
     return sharpe_from_daily(trades.groupby("entry_dubai_date")["pnl_cents"].sum())
-

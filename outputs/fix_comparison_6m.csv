@@ -1,0 +1,5 @@
+run,fill_model,chosen_parameter_set,oos_pnl_cents,sharpe,win_month_rate,top_3_removed_pnl_cents,randomized_entry_p,distinct_winners_across_folds
+Before fixes,Model A - mid + dynamic cost,a=300s | b=0.3x sigma | c=1800s | d=14400s | reversal,-291.3378000000031,-0.9146149077312072,0.2222222222222222,-578.4108000000019,0.3196803196803197,7
+Before fixes,Model B - actual bid/ask,a=120s | b=0.5x sigma | c=900s | d=7200s | reversal,-234.9232000000096,-0.7345355236036984,0.3333333333333333,-526.9232000000084,0.3666333666333666,6
+After fixes,Model A - mid + dynamic cost,a=120s | b=0.9x sigma | c=900s | d=14400s | continuation,608.419193725586,3.3081803570125383,0.4444444444444444,284.2502613830567,0.006993006993006993,5
+After fixes,Model B - actual bid/ask,a=120s | b=0.9x sigma | c=900s | d=14400s | continuation,753.482546081543,3.7475244399463263,0.5555555555555556,431.4812796020508,0.014985014985014986,5

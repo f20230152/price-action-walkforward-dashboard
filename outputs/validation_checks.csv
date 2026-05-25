@@ -1,6 +1,5 @@
 check,pass,details
 data_source_scope,True,jan_nov_parquet=True; dec_mar_csv=True; no_old_oct_nov_csv=True
-prompt_contract_month_plus_2_mapping,True,2025-01:F:BRN\H25:True;2025-02:F:BRN\J25:True;2025-03:F:BRN\K25:True;2025-04:F:BRN\M25:True;2025-05:F:BRN\N25:True;2025-06:F:BRN\Q25:True;2025-07:F:BRN\U25:True;2025-08:F:BRN\V25:True;2025-09:F:BRN\X25:True;2025-10:F:BRN\Z25:True;2025-11:F:BRN\F26:True
 no_duplicate_timestamps_after_stitching,True,duplicates=0
 entries_inside_dubai_session,True,bad_entries=0
 exits_respect_hold_and_midnight,True,bad_exits=0
@@ -9,3 +8,9 @@ max_one_trade_per_parameter_day,True,max_daily_trades=1
 walkforward_train_test_strictly_separated,True,folds=42
 selection_winner_highest_composite,True,bad_folds=0
 randomized_entry_resamples,True,"('3m_train_1m_test', 'actual_bid_ask'):1000;('3m_train_1m_test', 'mid_dynamic_cost'):1000;('6m_train_1m_test', 'actual_bid_ask'):1000;('6m_train_1m_test', 'mid_dynamic_cost'):1000"
+liquidity_roll_no_near_expiry_trades,True,near_expiry_oos_trades=0
+liquidity_roll_daily_choice_documented,True,documented_days=282; loaded_parquet_days=186; undocumented_loaded_days=0
+sigma_no_ffill_for_estimation,True,sigma uses is_real_print mask and rolling real-print returns
+sigma_min_real_prints_enforced,True,bad_signals=0
+forward_filled_entry_exclusion,True,forward_filled_entries=0
+back_adjustment_continuity,True,max_roll_boundary_jump_cents=0.0000

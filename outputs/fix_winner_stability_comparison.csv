@@ -1,0 +1,5 @@
+schedule,fill_model,before_distinct_winners,after_distinct_winners
+3m_train_1m_test,mid_dynamic_cost,10,10
+3m_train_1m_test,actual_bid_ask,10,10
+6m_train_1m_test,mid_dynamic_cost,7,5
+6m_train_1m_test,actual_bid_ask,6,5

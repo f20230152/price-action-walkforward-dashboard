@@ -44,12 +44,30 @@ def load_outputs() -> dict:
     for name in REQUIRED_FILES:
         if name.endswith(".json"):
             data[name] = json.loads((OUT / name).read_text(encoding="utf-8"))
+        elif name.endswith(".md"):
+            data[name] = (OUT / name).read_text(encoding="utf-8")
         else:
             data[name] = pd.read_csv(OUT / name)
-    optional = ["robustness_summary.csv", "final_parameter_choices.csv"]
+    optional = [
+        "robustness_summary.csv",
+        "final_parameter_choices.csv",
+        "previous_run_summary.json",
+        "fix_comparison.md",
+        "fix_comparison_6m.csv",
+        "fix_comparison_3m.csv",
+        "fix_trade_count_diff.csv",
+        "fix_winner_stability_comparison.csv",
+    ]
     for name in optional:
         path = OUT / name
-        data[name] = pd.read_csv(path) if path.exists() else pd.DataFrame()
+        if not path.exists():
+            data[name] = {} if name.endswith(".json") else ("" if name.endswith(".md") else pd.DataFrame())
+        elif name.endswith(".json"):
+            data[name] = json.loads(path.read_text(encoding="utf-8"))
+        elif name.endswith(".md"):
+            data[name] = path.read_text(encoding="utf-8")
+        else:
+            data[name] = pd.read_csv(path)
     return data
 
 
@@ -114,6 +132,13 @@ def selected_summary(verdict: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def previous_selected_summary(previous: dict) -> pd.DataFrame:
+    rows = []
+    for fill_model, item in previous.get("selected", {}).items():
+        rows.append({"fill_model": fill_model, **item})
+    return pd.DataFrame(rows)
+
+
 def main() -> None:
     st.set_page_config(page_title="Fresh Brent Walk-Forward", layout="wide")
     st.title("Fresh Brent Price-Action Walk-Forward Dashboard")
@@ -124,6 +149,12 @@ def main() -> None:
         return
 
     verdict = outputs["verdict.json"]
+    previous = outputs["previous_run_summary.json"]
+    fix_md = outputs["fix_comparison.md"]
+    fix_6m = outputs["fix_comparison_6m.csv"]
+    fix_3m = outputs["fix_comparison_3m.csv"]
+    fix_trade_count = outputs["fix_trade_count_diff.csv"]
+    fix_stability = outputs["fix_winner_stability_comparison.csv"]
     coverage = outputs["data_coverage.csv"]
     prompt_calendar = outputs["prompt_contract_calendar.csv"]
     rankings = outputs["train_rankings.csv"]
@@ -152,12 +183,20 @@ def main() -> None:
             "Monthly Rebalance Decisions",
             "Full-Period Backtest",
             "Data Coverage",
+            "Fix Comparison",
         ]
     )
 
     with tabs[0]:
-        render_verdict_banner(verdict)
-        summary_df = selected_summary(verdict)
+        view = st.radio("Run view", ["After fixes", "Before fixes"], horizontal=True)
+        if previous.get("verdict") and previous.get("verdict") != verdict.get("verdict"):
+            st.warning("Verdict changed after fixing roll + sigma bugs - see Fix Comparison tab.")
+        if view == "Before fixes":
+            render_verdict_banner({"verdict": previous.get("verdict", "UNKNOWN"), "reasons": []})
+            summary_df = previous_selected_summary(previous)
+        else:
+            render_verdict_banner(verdict)
+            summary_df = selected_summary(verdict)
         cols = st.columns(4)
         if not summary_df.empty:
             model_b = summary_df[summary_df["fill_model"] == "actual_bid_ask"]
@@ -169,11 +208,12 @@ def main() -> None:
                 value = frame["oos_daily_sharpe"].iloc[0] if not frame.empty else float("nan")
                 cols[idx].metric(title, f"{value:,.2f}")
         show_table(summary_df, "Selected Parameter Sets", "summary_selected")
-        show_table(fill_comparison, "Fill Model Comparison", "summary_fill_comparison")
-        key_tests = robustness[robustness["test_name"].isin(["top_3_trade_removed_pnl", "win_month_rate", "randomized_entry_p_value", "bootstrap_mean_trade_ci_low"])].copy()
-        st.subheader("Key Robustness Tests")
-        st.dataframe(pass_style(key_tests), use_container_width=True, height=360)
-        download_table(key_tests, "Key Robustness Tests", "summary_key_tests")
+        if view == "After fixes":
+            show_table(fill_comparison, "Fill Model Comparison", "summary_fill_comparison")
+            key_tests = robustness[robustness["test_name"].isin(["top_3_trade_removed_pnl", "win_month_rate", "randomized_entry_p_value", "bootstrap_mean_trade_ci_low"])].copy()
+            st.subheader("Key Robustness Tests")
+            st.dataframe(pass_style(key_tests), use_container_width=True, height=360)
+            download_table(key_tests, "Key Robustness Tests", "summary_key_tests")
 
     with tabs[1]:
         render_verdict_banner(verdict)
@@ -294,6 +334,22 @@ def main() -> None:
         st.subheader("Validation Checks")
         st.dataframe(pass_style(validation), use_container_width=True, height=360)
         download_table(validation, "Validation Checks", "validation_checks")
+
+    with tabs[9]:
+        render_verdict_banner(verdict)
+        if not fix_md:
+            st.warning("Fix comparison outputs are not generated yet. Run `python -m src.run_research` after the D-drive parquet source is available.")
+            return
+        st.markdown(fix_md)
+        show_table(fix_6m, "Fix Comparison 6m", "fix_comparison_6m")
+        show_table(fix_3m, "Fix Comparison 3m", "fix_comparison_3m")
+        show_table(fix_trade_count, "Fix Trade Count Diff", "fix_trade_count")
+        show_table(fix_stability, "Fix Winner Stability", "fix_stability")
+        heatmap_paths = sorted((OUT / "diagnostics").glob("*_postfix.svg"))
+        if heatmap_paths:
+            st.subheader("Post-Fix Representative Heatmaps")
+            for path in heatmap_paths:
+                st.image(str(path), caption=path.name, use_container_width=True)
 
 
 if __name__ == "__main__":
